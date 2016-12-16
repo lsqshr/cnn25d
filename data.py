@@ -153,7 +153,9 @@ class BlockExtractor(object):
         # Get all candidate positions
         candidate_idx = self._get_candidates(bimg3d)
         nsample = candidate_idx.shape[0]
+        print('#Candidate:', nsample)
         nsample = self._nsample if nsample > self._nsample and self._nsample != -1 else nsample
+        print('#Extract:', nsample)
 
         # Claim the memory for all 2.5D blocks
         # nblock = nsample * len(self._radii) * self._nrotate
