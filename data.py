@@ -17,30 +17,28 @@ class Image3D(object):
         self._binary = None
 
     def pad(self, margin):
-        pimg = np.zeros(
-            (self._data.shape[0] + 2 * margin,
-             self._data.shape[1] + 2 * margin,
-             self._data.shape[2] + 2 * margin))
-        pimg[margin:margin + self._data.shape[0],
-             margin:margin + self._data.shape[1],
-             margin:margin + self._data.shape[2]] = self._data
+        pimg = np.zeros((self._data.shape[0] + 2 * margin,
+                         self._data.shape[1] + 2 * margin,
+                         self._data.shape[2] + 2 * margin))
+        pimg[margin:margin + self._data.shape[0], margin:margin + self._data.
+             shape[1], margin:margin + self._data.shape[2]] = self._data
 
         self._data = pimg
 
         if self._binary is not None:
             pimg.fill(0)
-            pimg[margin:margin + self._binary.shape[0],
-                 margin:margin + self._binary.shape[1],
-                 margin:margin + self._binary.shape[2]] = self._binary
+            pimg[margin:margin + self._binary.shape[0], margin:margin +
+                 self._binary.shape[1], margin:margin + self._binary.shape[
+                     2]] = self._binary
             self._binary = pimg
 
     def unpad(self, margin):
         pimg = np.zeros((self._data.shape[0] - 2 * margin,
                          self._data.shape[1] - 2 * margin,
                          self._data.shape[2] - 2 * margin))
-        pimg = self._data[margin:margin + self._data.shape[0],
-                          margin:margin + self._data.shape[1],
-                          margin:margin + self._data.shape[2]]
+        pimg = self._data[margin:margin + self._data.shape[
+            0], margin:margin + self._data.shape[1], margin:margin +
+                          self._data.shape[2]]
         self._data = pimg
 
     def get_data(self):
@@ -150,10 +148,7 @@ class DistanceMap3D(Image3D):
 
 
 class BlockExtractor(object):
-    def __init__(self,
-                 K=7,
-                 radii=(7, 11, 15),
-                 nrotate=1):
+    def __init__(self, K=7, radii=(7, 11, 15), nrotate=1):
         self._K = K  # Block Radius
         self._kernelsz = 2 * K + 1
         self._radii = radii  # Radii to sample at each location
@@ -178,10 +173,8 @@ class BlockExtractor(object):
         imgvox = self._bimg3d.get_data()
 
         # Claim the memory for all 2.5D blocks
-        # nblock = nsample * len(self._radii) * self._nrotate
         self._blocks = np.zeros(shape=(nsample, self._nrotate,
-                                       len(self._radii),
-                                       2 * self._K + 1,
+                                       len(self._radii), 2 * self._K + 1,
                                        2 * self._K + 1, 3))
         self._dist = np.zeros((nsample, 1))  # Claim the memory for 2.5D blocks
 
@@ -189,21 +182,45 @@ class BlockExtractor(object):
                                np.arange(imgvox.shape[1]),
                                np.arange(imgvox.shape[2]))
 
-        # Start extracting blocks
-        for i in range(nsample):
-            bx, by, bz = self._candidates[i, :]
+        # The grid used below this are all flatten for speed
+        base_flatten_grid = np.zeros((3, 4, self._grids[0][0].size))
+
+        for i in range(3):
+            base_flatten_grid[i, :, :] = np.stack(
+                (self._grids[i][0].flatten(), self._grids[i][1].flatten(),
+                 self._grids[i][2].flatten(), np.ones(self._grids[0][0].size)))
+
+        # Extract the ground truth labels
+        for bx, by, bz in self._candidates:
             self._dist[i] = self._distmap.get(bx, by, bz)
-            for r in range(self._nrotate):
-                for s in range(len(self._radii)):
-                    self._transform_grids(self._radii[s] / self._K,
-                                          (np.random.rand() * 2 * np.pi,
-                                           np.random.rand() * 2 * np.pi,
-                                           np.random.rand() * 2 * np.pi),
-                                          (bx, by, bz))
+
+        # Start extracting blocks
+        for r in range(self._nrotate):
+            # Rotation Transform
+            rot_trns_grid = base_flatten_grid.copy()
+            rx, ry, rz = self._make_rotation_transform(
+                np.random.rand() * 2 * np.pi,
+                np.random.rand() * 2 * np.pi, np.random.rand() * 2 * np.pi)
+            rot_trns_grid = self._apply_transform(rot_trns_grid, rx)
+            rot_trns_grid = self._apply_transform(rot_trns_grid, ry)
+            rot_trns_grid = self._apply_transform(rot_trns_grid, rz)
+
+            for s in range(len(self._radii)):
+                # Scale transform
+                scale_trns_grid = rot_trns_grid.copy()
+                rs = self._make_scale_transform(self._radii[s] / self._K)
+                scale_trns_grid = self._apply_transform(scale_trns_grid, rs)
+                for i in range(nsample):
+                    # Spatial Transform
+                    bx, by, bz = self._candidates[i, :]
+                    trans_trns_grid = scale_trns_grid.copy()
+                    rt = self._make_translation_transform(bx, by, bz)
+                    trans_trns_grid = self._apply_transform(trans_trns_grid,
+                                                            rt)
 
                     # Sample the 2.5D block with the current grids
-                    self._blocks[i, r, s, :, :, :] = self._sample(imgvox)
-                    self._reset_grids()
+                    self._blocks[i, r, s, :, :, :] = self._sample(
+                        trans_trns_grid, imgvox)
 
     def get_outputs(self):
         return self._blocks, self._dist
@@ -211,16 +228,10 @@ class BlockExtractor(object):
     def get_candidates(self):
         return self._candidates
 
-    def _sample(self, imgvox):
-        xy_pts = np.stack(
-            (self._grids[0][0].flatten(), self._grids[0][1].flatten(),
-             self._grids[0][2].flatten())).T
-        yz_pts = np.stack(
-            (self._grids[1][0].flatten(), self._grids[1][1].flatten(),
-             self._grids[1][2].flatten())).T
-        xz_pts = np.stack(
-            (self._grids[2][0].flatten(), self._grids[2][1].flatten(),
-             self._grids[2][2].flatten())).T
+    def _sample(self, trns, imgvox):
+        xy_pts = trns[0, :3, :].T
+        yz_pts = trns[0, :3, :].T
+        xz_pts = trns[0, :3, :].T
         binterp = RegularGridInterpolator(self._standard_grid, imgvox)
         return np.stack(
             (binterp(xy_pts).reshape(self._kernelsz, self._kernelsz),
@@ -239,8 +250,7 @@ class BlockExtractor(object):
         grid_xy_x, grid_xy_y, grid_xy_z = np.meshgrid(x, y, 0)
 
         # Make Grid 2 on YZ plane
-        grid_yz_x, grid_yz_y, grid_yz_z = np.meshgrid(
-            0, y, z)
+        grid_yz_x, grid_yz_y, grid_yz_z = np.meshgrid(0, y, z)
 
         # Make Grid 3 on XZ plane
         grid_xz_x, grid_xz_y, grid_xz_z = np.meshgrid(x, 0, z)
@@ -248,38 +258,22 @@ class BlockExtractor(object):
         self._grids_backup = [[grid_xy_x, grid_xy_y, grid_xy_z],
                               [grid_yz_x, grid_yz_y, grid_yz_z],
                               [grid_xz_x, grid_xz_y, grid_xz_z]]
-        self._grids = [[None, None, None], [None, None, None],
-                       [None, None, None]]
-        self._reset_grids()
+        self._grids = self._grids_backup.copy()
 
-    def _reset_grids(self):
+    def _apply_transform(self, flatten_grid, trns):
+        result_grid = np.zeros((flatten_grid.shape))
         for i in range(3):
-            for j in range(3):
-                self._grids[i][j] = self._grids_backup[i][j].copy()
+            result_grid[i][:] = flatten_grid[i][:].T.dot(trns).T
+        return result_grid
 
-    def _transform_grids(self, scale_ratio, rotation, translation):
-        rx, ry, rz, rs, rt = self._make_transform(scale_ratio,
-                                                  rotation, translation)
+    def _make_sample_grid(self, trns):
         gridshape = self._grids[0][0].shape
-
         for i in range(3):
-            g = np.stack(
-                (self._grids[i][0].flatten(), self._grids[i][1].flatten(),
-                 self._grids[i][2].flatten(),
-                 np.ones(self._grids[0][0].size)))
-            g = g.T.dot(rx).T
-            g = g.T.dot(ry).T
-            g = g.T.dot(rz).T
-            g = g.T.dot(rs).T
-            g = g.T.dot(rt).T
-            self._grids[i][0] = g[0, :].reshape(gridshape)
-            self._grids[i][1] = g[1, :].reshape(gridshape)
-            self._grids[i][2] = g[2, :].reshape(gridshape)
+            self._grids[i][0] = trns[i, 0, :].reshape(gridshape)
+            self._grids[i][1] = trns[i, 1, :].reshape(gridshape)
+            self._grids[i][2] = trns[i, 2, :].reshape(gridshape)
 
-    def _make_transform(self, scale_ratio, rotation, translation):
-        angle_x, angle_y, angle_z = rotation
-        tx, ty, tz = translation
-
+    def _make_rotation_transform(self, angle_x, angle_y, angle_z):
         # Rotation Mat X
         rx = np.asarray(
             [[1, 0, 0, 0], [0, np.cos(angle_x), -np.sin(angle_x), 0],
@@ -294,16 +288,19 @@ class BlockExtractor(object):
         rz = np.asarray([[np.cos(angle_z), -np.sin(angle_z), 0, 0],
                          [np.sin(angle_z), np.cos(angle_z), 0, 0],
                          [0, 0, 1, 0], [0, 0, 0, 1]])
+        return rx, ry, rz
 
+    def _make_scale_transform(self, scale_ratio):
         # Scale Matrix
         rs = np.asarray([[scale_ratio, 0, 0, 0], [0, scale_ratio, 0, 0],
                          [0, 0, scale_ratio, 0], [0, 0, 0, 1]])
+        return rs
 
-        # Translation Matrix
+    def _make_translation_transform(self, tx, ty, tz):
+        # Scale Matrix
         rt = np.asarray([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0],
                          [tx, ty, tz, 1]])
-
-        return rx, ry, rz, rs, rt
+        return rt
 
 
 class BlockDB(object):
@@ -374,7 +371,9 @@ class BlockDB(object):
         # Setup the tqdm bar
         pbar = tqdm(total=nsample_to_extract)
         e = BlockExtractor(  # In python, Thread can only be started once
-            K=K, radii=radii, nrotate=nrotate)
+            K=K,
+            radii=radii,
+            nrotate=nrotate)
         e.set_input(img, distmap)
         while True:
             batch_end = batch_start + self._extract_batch_size
@@ -420,9 +419,8 @@ class BlockDB(object):
                 e = Process(
                     name=img,
                     target=self.extract_image,
-                    args=(imgname, imgvox, swc, img['misc']['threshold'],
-                          K, radii, nrotate, nsample,
-                          template_img, sema))
+                    args=(imgname, imgvox, swc, img['misc']['threshold'], K,
+                          radii, nrotate, nsample, template_img, sema))
                 process_pool.append(e)
                 e.start()
 
@@ -478,7 +476,8 @@ if __name__ == '__main__':
         type=str,
         default=None,
         required=True,
-        help='The input file. A image file (*.tif, *.nii, *.mat). It can also be a json file.')
+        help='The input file. A image file (*.tif, *.nii, *.mat). It can also be a json file.'
+    )
 
     parser.add_argument(
         '-o',
@@ -494,7 +493,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         required=False,
-        help='The input swc file. Not used if --file is a json file' )
+        help='The input swc file. Not used if --file is a json file')
 
     parser.add_argument(
         '-z',
@@ -502,8 +501,7 @@ if __name__ == '__main__':
         type=float,
         default=1.,
         help='''The factor to zoom the image to speed up the whole thing.
-                Default 1.'''
-    )
+                Default 1.''')
 
     parser.add_argument(
         '-t',
@@ -519,8 +517,7 @@ if __name__ == '__main__':
         default=-1,
         help=''''Number of samples to extract.
               If nsample<0, extract as many as possible
-              according to the threshold. Default -1'''
-    )
+              according to the threshold. Default -1''')
 
     parser.add_argument(
         '--template',
@@ -562,12 +559,13 @@ if __name__ == '__main__':
 
         print('imgvox.shape:', imgvox.shape)
         print('imgvox.shape:', template_img.shape)
-        db.extract_image(os.path.split(args.file)[1],
-                         imgvox,
-                         swc,
-                         threshold=args.threshold,
-                         K=K,
-                         radii=RADII,
-                         nrotate=1,
-                         nsample=args.nsample,
-                         template_img=template_img)
+        db.extract_image(
+            os.path.split(args.file)[1],
+            imgvox,
+            swc,
+            threshold=args.threshold,
+            K=K,
+            radii=RADII,
+            nrotate=1,
+            nsample=args.nsample,
+            template_img=template_img)
