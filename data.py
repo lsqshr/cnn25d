@@ -1,4 +1,5 @@
 # %load data.py
+import time
 import math
 from tqdm import tqdm
 import numpy as np
@@ -6,8 +7,8 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage.morphology import morphological_gradient, binary_dilation
 import skfmm
 import h5py
-# from threading import Thread, Semaphore
-from multiprocessing import Process, Semaphore
+# from threading import Thread, mp.Semaphore
+import multiprocessing as mp
 import json
 
 
@@ -149,6 +150,7 @@ class DistanceMap3D(Image3D):
 
 class BlockExtractor(object):
     def __init__(self, K=7, radii=(7, 11, 15), nrotate=1):
+        super(BlockExtractor, self).__init__()
         self._K = K  # Block Radius
         self._kernelsz = 2 * K + 1
         self._radii = radii  # Radii to sample at each location
@@ -161,6 +163,16 @@ class BlockExtractor(object):
 
     def set_candidates(self, candidates):
         self._candidates = candidates
+
+    def set_batch_bounds(self, start, end):
+        self._batch_start = start
+        self._batch_end = end
+
+    def set_pbar(self, pbar):
+        self._pbar = pbar
+
+    def get_batch_bounds(self):
+        return self._batch_start, self._batch_end
 
     def run(self):
         '''
@@ -326,10 +338,11 @@ class BlockDB(object):
                       nrotate=1,
                       nsample=-1,
                       template_img=None,
+                      nthread=1,
                       sema=None):
 
-        if sema:
-            sema.acquire()
+        # if sema:
+        #     sema.acquire()
 
         # Pad Image
         img = Image3D(imgvox)
@@ -364,39 +377,84 @@ class BlockDB(object):
         data_grp.create_dataset('y', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
 
-        # Extract blocks batch by batch
-        # batch_end = self._extract_batch_size
-        batch_start = 0
-
         # Setup the tqdm bar
-        pbar = tqdm(total=nsample_to_extract)
-        e = BlockExtractor(  # In python, Thread can only be started once
-            K=K,
-            radii=radii,
-            nrotate=nrotate)
-        e.set_input(img, distmap)
+        task_queue = mp.JoinableQueue()
+        self._pbar = tqdm(total=nsample_to_extract)
+        self._pbar_sema = mp.Semaphore(value=1)
+
+        procs = []
+        # Start the Process Workers
+        for i in range(nthread):
+            # Make the process pool
+            # Send off the extractors
+            for i in range(nthread):
+                p = mp.Process(
+                    name=str(i),
+                    target=self._extract_worker,
+                    args=(data_grp, task_queue))
+                p.daemon = True
+                p.start()
+                procs.append(p)
+
+        # Put the extraction tasks into task queue
+        batch_start = 0
         while True:
             batch_end = batch_start + self._extract_batch_size
             batch_end = batch_end if batch_end <= nsample_to_extract else nsample_to_extract
             batch_candidates = candidates[batch_start:batch_end, :]
+
+            print('Putting ', batch_start, batch_end)
+
+            e = BlockExtractor(K=K, radii=radii, nrotate=nrotate)
+            e.set_input(img, distmap)
             e.set_candidates(batch_candidates)
-            e.run()
-            batch_start += self._extract_batch_size  # Move to next batch
+            e.set_batch_bounds(batch_start, batch_end)
 
-            x, y = e.get_outputs()
-            c = e.get_candidates()
+            task_queue.put(e)
 
+            batch_start += self._extract_batch_size
+
+            if batch_start >= nsample_to_extract:
+                break
+
+        print('Ready to join the task queue')
+        task_queue.join()
+
+        for p in procs:
+            task_queue.put(None)
+
+        task_queue.join()
+
+        for p in procs:
+            p.join()
+
+        self._pbar.close()
+
+        print("Finished everything...")
+
+    def _extract_worker(self, data_grp, task_queue):
+        for item in iter(task_queue.get, None):
+            x, y, c, batch_start, batch_end = self._extract_process(item)
             # Append the blocks to hdf5
             data_grp['x'][batch_start:batch_end, :, :, :, :, :] = x
             data_grp['y'][batch_start:batch_end, :] = y
             data_grp['c'][batch_start:batch_end] = c
-            pbar.update(self._extract_batch_size)
+            task_queue.task_done()
 
-            if batch_start > nsample_to_extract:
-                break
+        task_queue.task_done()
 
-        if sema:
-            sema.release()
+    def _extract_process(self, extractor):
+        batch_start, batch_end = extractor.get_batch_bounds()
+        print('Working on ', batch_start, batch_end)
+        extractor.run()
+        print('Finished on ', batch_start, batch_end)
+        x, y = extractor.get_outputs()
+        c = extractor.get_candidates()
+
+        self._pbar_sema.acquire()
+        self._pbar.update(self._extract_batch_size)
+        self._pbar_sema.release()
+        return x, y, c, batch_start, batch_end
 
     def extract_from_json(self,
                           json_file,
@@ -409,14 +467,14 @@ class BlockDB(object):
         d = json.load(open(json_file, 'r'))
         root = os.path.join(os.path.split(json_file)[0], d['rootpath'])
         process_pool = []
-        sema = Semaphore(value=nthread)
+        sema = mp.Semaphore(value=nthread)
         for dataset in d['data']:
             for imgname in d['data'][dataset]:
 
                 img = d['data'][dataset][imgname]
                 imgvox = loadimg(os.path.join(root, img['imagepath']))
                 swc = loadswc(os.path.join(root, img['groundtruth']))
-                e = Process(
+                e = mp.Process(
                     name=img,
                     target=self.extract_image,
                     args=(imgname, imgvox, swc, img['misc']['threshold'], K,
@@ -568,4 +626,5 @@ if __name__ == '__main__':
             radii=RADII,
             nrotate=1,
             nsample=args.nsample,
-            template_img=template_img)
+            template_img=template_img,
+            nthread=args.thread)
