@@ -168,9 +168,6 @@ class BlockExtractor(object):
         self._batch_start = start
         self._batch_end = end
 
-    def set_pbar(self, pbar):
-        self._pbar = pbar
-
     def get_batch_bounds(self):
         return self._batch_start, self._batch_end
 
@@ -314,7 +311,7 @@ class BlockExtractor(object):
                          [tx, ty, tz, 1]])
         return rt
 
-
+        
 class BlockDB(object):
     '''
     A Simple Database system to store&query the
@@ -323,10 +320,15 @@ class BlockDB(object):
 
     def __init__(self, extract_batch_size=1000):
         self._extract_batch_size = extract_batch_size
+        self._sema = mp.Semaphore(1)
 
     def connect(self, h5file=None, mode='a'):
         print('-- Trying to open h5 file at %s' % h5file)
-        self._db = h5py.File(h5file, "a")
+        self._db = h5py.File(h5file, mode)
+        self._h5file = h5file
+
+    def disconnect(self):
+        self._db.close()
 
     def extract_image(self,
                       img_name,
@@ -340,9 +342,6 @@ class BlockDB(object):
                       template_img=None,
                       nthread=1,
                       sema=None):
-
-        # if sema:
-        #     sema.acquire()
 
         # Pad Image
         img = Image3D(imgvox)
@@ -376,25 +375,22 @@ class BlockDB(object):
                                       2 * K + 1, 2 * K + 1, 3))
         data_grp.create_dataset('y', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
+        self._db.close()  # Close for safe write
 
         # Setup the tqdm bar
         task_queue = mp.JoinableQueue()
-        self._pbar = tqdm(total=nsample_to_extract)
-        self._pbar_sema = mp.Semaphore(value=1)
 
         procs = []
         # Start the Process Workers
         for i in range(nthread):
             # Make the process pool
-            # Send off the extractors
-            for i in range(nthread):
-                p = mp.Process(
-                    name=str(i),
-                    target=self._extract_worker,
-                    args=(data_grp, task_queue))
-                p.daemon = True
-                p.start()
-                procs.append(p)
+            p = mp.Process(
+                name=str(i),
+                target=self._extract_worker,
+                args=(img_name, task_queue))
+            p.daemon = True
+            p.start()
+            procs.append(p)
 
         # Put the extraction tasks into task queue
         batch_start = 0
@@ -428,18 +424,21 @@ class BlockDB(object):
         for p in procs:
             p.join()
 
-        self._pbar.close()
-
         print("Finished everything...")
 
-    def _extract_worker(self, data_grp, task_queue):
+    def _extract_worker(self, img_name, task_queue):
         for item in iter(task_queue.get, None):
             x, y, c, batch_start, batch_end = self._extract_process(item)
+
+            self._sema.acquire()
+            self.connect(self._h5file, 'a')
             # Append the blocks to hdf5
-            data_grp['x'][batch_start:batch_end, :, :, :, :, :] = x
-            data_grp['y'][batch_start:batch_end, :] = y
-            data_grp['c'][batch_start:batch_end] = c
+            self._db[img_name]['data']['x'][batch_start:batch_end, :, :, :, :, :] = x
+            self._db[img_name]['data']['y'][batch_start:batch_end, :] = y
+            self._db[img_name]['data']['c'][batch_start:batch_end] = c
             task_queue.task_done()
+            self.disconnect()
+            self._sema.release()
 
         task_queue.task_done()
 
@@ -451,9 +450,6 @@ class BlockDB(object):
         x, y = extractor.get_outputs()
         c = extractor.get_candidates()
 
-        self._pbar_sema.acquire()
-        self._pbar.update(self._extract_batch_size)
-        self._pbar_sema.release()
         return x, y, c, batch_start, batch_end
 
     def extract_from_json(self,
@@ -589,13 +585,19 @@ if __name__ == '__main__':
         default=1,
         help="Number of threads to extract blocks. Default -1")
 
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=1000,
+        help="Size of the batch to write h5 file. Default 1000")
+
     args = parser.parse_args()
     K = 7
     RADII = [7, 9, 11, 13, 15]
     NROTATE = 3
 
     # Extract 2.5D Blocks
-    db = BlockDB(1000)
+    db = BlockDB(args.batch_size)
     db.connect(h5file=args.h5)
 
     template_img = None
@@ -624,7 +626,7 @@ if __name__ == '__main__':
             threshold=args.threshold,
             K=K,
             radii=RADII,
-            nrotate=1,
+            nrotate=3,
             nsample=args.nsample,
             template_img=template_img,
             nthread=args.thread)
