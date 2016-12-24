@@ -330,18 +330,18 @@ class BlockDB(object):
     def disconnect(self):
         self._db.close()
 
-    def extract_image(self,
-                      img_name,
-                      imgvox,
-                      swc,
-                      threshold=0,
-                      K=7,
-                      radii=[7, 9, 11],
-                      nrotate=1,
-                      nsample=-1,
-                      template_img=None,
-                      nthread=1,
-                      sema=None):
+    def im_extract(self,
+                   img_name,
+                   imgvox,
+                   swc,
+                   threshold=0,
+                   K=7,
+                   radii=[7, 9, 11],
+                   nrotate=1,
+                   nsample=-1,
+                   template_img=None,
+                   nthread=1,
+                   sema=None):
 
         # Pad Image
         img = Image3D(imgvox)
@@ -424,8 +424,6 @@ class BlockDB(object):
         for p in procs:
             p.join()
 
-        print("Finished everything...")
-
     def _extract_worker(self, img_name, task_queue):
         for item in iter(task_queue.get, None):
             x, y, c, batch_start, batch_end = self._extract_process(item)
@@ -451,35 +449,6 @@ class BlockDB(object):
         c = extractor.get_candidates()
 
         return x, y, c, batch_start, batch_end
-
-    def extract_from_json(self,
-                          json_file,
-                          K,
-                          radii,
-                          nrotate,
-                          nsample,
-                          template_img,
-                          nthread=1):
-        d = json.load(open(json_file, 'r'))
-        root = os.path.join(os.path.split(json_file)[0], d['rootpath'])
-        process_pool = []
-        sema = mp.Semaphore(value=nthread)
-        for dataset in d['data']:
-            for imgname in d['data'][dataset]:
-
-                img = d['data'][dataset][imgname]
-                imgvox = loadimg(os.path.join(root, img['imagepath']))
-                swc = loadswc(os.path.join(root, img['groundtruth']))
-                e = mp.Process(
-                    name=img,
-                    target=self.extract_image,
-                    args=(imgname, imgvox, swc, img['misc']['threshold'], K,
-                          radii, nrotate, nsample, template_img, sema))
-                process_pool.append(e)
-                e.start()
-
-        for e in process_pool:
-            e.join()
 
     def _get_candidates(self, img3d):
         bimg = img3d.get_binary()
@@ -604,29 +573,24 @@ if __name__ == '__main__':
     if args.template:
         template_img = loadimg(args.template)
 
-    if os.path.splitext(args.file)[1] == '.json':
-        print('Loading from json file', args.file)
-        db.extract_from_json(args.file, K, RADII, NROTATE, args.nsample,
-                             template_img, args.thread)
-    else:
-        print('Loading image file', args.file)
-        imgvox = loadimg(args.file)
-        swc = loadswc(args.swc)
+    print('Loading image file', args.file)
+    imgvox = loadimg(args.file)
+    swc = loadswc(args.swc)
 
-        if args.zoom_factor != 1.:
-            imgvox = zoom(imgvox, args.zoom_factor)
-            swc[:, 2:5] *= args.zoom_factor
+    if args.zoom_factor != 1.:
+        imgvox = zoom(imgvox, args.zoom_factor)
+        swc[:, 2:5] *= args.zoom_factor
 
-        print('imgvox.shape:', imgvox.shape)
-        print('imgvox.shape:', template_img.shape)
-        db.extract_image(
-            os.path.split(args.file)[1],
-            imgvox,
-            swc,
-            threshold=args.threshold,
-            K=K,
-            radii=RADII,
-            nrotate=3,
-            nsample=args.nsample,
-            template_img=template_img,
-            nthread=args.thread)
+    db.im_extract(
+        os.path.split(args.file)[1],
+        imgvox,
+        swc,
+        threshold=args.threshold,
+        K=K,
+        radii=RADII,
+        nrotate=3,
+        nsample=args.nsample,
+        template_img=template_img,
+        nthread=args.thread)
+
+    db.disconnect()
