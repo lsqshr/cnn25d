@@ -499,7 +499,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         required=True,
-        help='The input file. A image file (*.tif, *.nii, *.mat). It can also be a json file.'
+        help='The input file. A image file (*.tif, *.nii, *.mat). '
     )
 
     parser.add_argument(
