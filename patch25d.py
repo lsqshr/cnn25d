@@ -11,6 +11,8 @@ import h5py
 import multiprocessing as mp
 import json
 
+from matplotlib import pyplot as plt
+
 
 class Image3D(object):
     def __init__(self, data=None):
@@ -132,8 +134,28 @@ class DistanceMap3D(Image3D):
 
     def _make_from_swc(self, swc, shape):
         skimg = np.ones(shape)
+
+        # Add nodes the current swc to make sure there is
+        # at least one node in each voxel on a branch
+        idlist = swc[:, 0]
+        extra_nodes = []
+        for i in range(swc.shape[0]):
+            cnode = swc[i, 2:5]
+            pnode = swc[idlist == swc[i, 6], 2:5]
+            dvec = pnode - cnode
+            dvox = np.floor(np.linalg.norm(dvec))
+            if dvox >= 1:
+                uvec = dvec / (dvox + 1)
+                extra_nodes.extend([cnode + uvec * i for i in range(1, int(dvox))])
+
+        # Deal with nodes in swc
         for i in range(swc.shape[0]):
             node = [math.floor(n) for n in swc[i, 2:5]]
+            skimg[node[0], node[1], node[2]] = 0
+
+        # Deal with the extra nodes
+        for ex in extra_nodes:
+            node = [math.floor(n) for n in ex[0]]
             skimg[node[0], node[1], node[2]] = 0
 
         a, dm = 6, 5
@@ -311,8 +333,8 @@ class BlockExtractor(object):
                          [tx, ty, tz, 1]])
         return rt
 
-        
-class BlockDB(object):
+
+class Patch25DB(object):
     '''
     A Simple Database system to store&query the
     2.5 blocks of voxels using h5 files
@@ -358,6 +380,14 @@ class BlockDB(object):
         print('Extracting 2.5D blocks from %s' % img_name)
         # Calls BlockExtractor
         candidates = self._get_candidates(img)
+       
+        # candidatemap = np.zeros((img.get_data().shape[:2]))
+        # for bx, by, bz in candidates:
+        #     candidatemap[math.floor(bx), math.floor(by)] = 1
+        # plt.imshow(candidatemap) 
+        # plt.title('original candidate map')
+        # plt.show()
+
         nsample_to_extract = candidates.shape[0] if candidates.shape[
             0] < nsample or nsample < 0 else nsample
 
@@ -430,8 +460,10 @@ class BlockDB(object):
 
             self._sema.acquire()
             self.connect(self._h5file, 'a')
+
             # Append the blocks to hdf5
-            self._db[img_name]['data']['x'][batch_start:batch_end, :, :, :, :, :] = x
+            self._db[img_name]['data']['x'][batch_start:
+                                            batch_end, :, :, :, :, :] = x
             self._db[img_name]['data']['y'][batch_start:batch_end, :] = y
             self._db[img_name]['data']['c'][batch_start:batch_end] = c
             task_queue.task_done()
@@ -458,8 +490,47 @@ class BlockDB(object):
             bimg = binary_dilation(bimg)
 
         idx = np.argwhere(bimg)
-        np.random.shuffle(idx)
         return idx
+
+    def get_im_num(self):
+        return len(self._db.keys())
+
+    def select_patches_from(self, idx, nsample_each):
+        img_names = [k for k in self._db['/'].keys()]
+        x = self._db[img_names[idx]]['data']['x']  # Total number of locations
+        y = self._db[img_names[idx]]['data']['y']  # Total number of locations
+        c = self._db[img_names[idx]]['data']['c']  # Total number of locations
+        n, nrotate, nscale, kernelsz, _, _ = x.shape
+
+        # Sample half with zeros
+        y_np = np.squeeze(np.array(y))  # Convert y to numpy array
+        zero_idx = np.argwhere(y_np == 0)
+        nonzero_idx = np.argwhere(y_np > 0)
+        np.random.shuffle(zero_idx)
+        np.random.shuffle(nonzero_idx)
+        nsample_each_cls = np.floor(nsample_each / 2)
+        sample_idx = np.concatenate(
+            (zero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
+                      else zero_idx.size],
+             nonzero_idx[:nsample_each if zero_idx.size > nsample_each_cls
+                         else zero_idx.size]))
+        np.random.shuffle(sample_idx)
+        sample_idx = sample_idx.flatten()
+        print(sample_idx)
+
+        # Claim memory for the patches
+        patches = np.zeros(
+            (nsample_each, nrotate, nscale, kernelsz, kernelsz, 3))
+
+        groundtruth = np.zeros((nsample_each, 1))
+        coords = np.zeros((nsample_each, 3))
+
+        for i, idx in enumerate(sample_idx):
+            patches[i, :, :, :, :] = x[idx, :, :, :, :]
+            groundtruth[i] = y[idx]
+            coords[i] = c[idx, :]
+
+        return patches, groundtruth, coords
 
 
 def flatten_blocks(x, y=None):
@@ -499,8 +570,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         required=True,
-        help='The input file. A image file (*.tif, *.nii, *.mat). '
-    )
+        help='The input file. A image file (*.tif, *.nii, *.mat). ')
 
     parser.add_argument(
         '-o',
@@ -566,7 +636,7 @@ if __name__ == '__main__':
     NROTATE = 3
 
     # Extract 2.5D Blocks
-    db = BlockDB(args.batch_size)
+    db = Patch25DB(args.batch_size)
     db.connect(h5file=args.h5)
 
     template_img = None

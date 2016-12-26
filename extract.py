@@ -99,7 +99,7 @@ if __name__ == '__main__':
         os.path.split(args.file)[1], img, distmap,
         K, RADII, NROTATE, nsample=args.nsample)
 
-    # if os.path.exists('blocks.h5'):
+# if os.path.exists('blocks.h5'):
 # print('Load Blocks from blocks.h5...')
 # h5f = h5py.File('blocks.h5', 'r')
 # x = h5f['input/x'][:]
