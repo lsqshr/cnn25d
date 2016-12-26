@@ -1,4 +1,3 @@
-# %load data.py
 import time
 import math
 from tqdm import tqdm
@@ -179,9 +178,10 @@ class BlockExtractor(object):
         self._nrotate = nrotate  # Number of random rotations to perform
         self._init_grids()
 
-    def set_input(self, bimg3d, distmap):
+    def set_input(self, bimg3d, distmap, labelmap):
         self._bimg3d = bimg3d
         self._distmap = distmap
+        self._labelmap = labelmap
 
     def set_candidates(self, candidates):
         self._candidates = candidates
@@ -207,7 +207,8 @@ class BlockExtractor(object):
         self._blocks = np.zeros(shape=(nsample, self._nrotate,
                                        len(self._radii), 2 * self._K + 1,
                                        2 * self._K + 1, 3))
-        self._dist = np.zeros((nsample, 1))  # Claim the memory for 2.5D blocks
+        self._dist = np.zeros((nsample, 1))
+        self._label = np.zeros((nsample, 1))
 
         self._standard_grid = (np.arange(imgvox.shape[0]),
                                np.arange(imgvox.shape[1]),
@@ -222,8 +223,15 @@ class BlockExtractor(object):
                  self._grids[i][2].flatten(), np.ones(self._grids[0][0].size)))
 
         # Extract the ground truth labels
-        for bx, by, bz in self._candidates:
+        for i, (bx, by, bz) in enumerate(self._candidates):
             self._dist[i] = self._distmap.get(bx, by, bz)
+            self._label[i] = self._labelmap.get(bx, by, bz)
+            print(i, ' Candidate at ', bx, by, bz, '\tdist:',
+                  self._dist[i], '\tlabel:',
+                  self._label[i])
+
+        print('%d/%d are nonzero' %
+              (self._label.flatten().sum(), self._label.size))
 
         # Start extracting blocks
         for r in range(self._nrotate):
@@ -252,9 +260,10 @@ class BlockExtractor(object):
                     # Sample the 2.5D block with the current grids
                     self._blocks[i, r, s, :, :, :] = self._sample(
                         trans_trns_grid, imgvox)
+        print('End of extraction')
 
     def get_outputs(self):
-        return self._blocks, self._dist
+        return self._blocks, self._dist, self._label
 
     def get_candidates(self):
         return self._candidates
@@ -374,19 +383,15 @@ class Patch25DB(object):
         img.pad(max(radii) * 2)
 
         print('Making Distance Transform Map...')
-        distmap = DistanceMap3D(swc, imgvox.shape, binary=True)
+        distmap = DistanceMap3D(swc, imgvox.shape, binary=False)
         distmap.pad(max(radii) * 2)
+        labelmap = DistanceMap3D(swc, imgvox.shape, binary=True)
+        labelmap.pad(max(radii) * 2)
+
 
         print('Extracting 2.5D blocks from %s' % img_name)
         # Calls BlockExtractor
         candidates = self._get_candidates(img)
-       
-        # candidatemap = np.zeros((img.get_data().shape[:2]))
-        # for bx, by, bz in candidates:
-        #     candidatemap[math.floor(bx), math.floor(by)] = 1
-        # plt.imshow(candidatemap) 
-        # plt.title('original candidate map')
-        # plt.show()
 
         nsample_to_extract = candidates.shape[0] if candidates.shape[
             0] < nsample or nsample < 0 else nsample
@@ -403,7 +408,8 @@ class Patch25DB(object):
         data_grp = img_grp.create_group('data')
         data_grp.create_dataset('x', (nsample_to_extract, nrotate, len(radii),
                                       2 * K + 1, 2 * K + 1, 3))
-        data_grp.create_dataset('y', (nsample_to_extract, 1))
+        data_grp.create_dataset('dist', (nsample_to_extract, 1))
+        data_grp.create_dataset('label', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
         self._db.close()  # Close for safe write
 
@@ -429,10 +435,10 @@ class Patch25DB(object):
             batch_end = batch_end if batch_end <= nsample_to_extract else nsample_to_extract
             batch_candidates = candidates[batch_start:batch_end, :]
 
-            print('Putting ', batch_start, batch_end)
+            # print('Putting ', batch_start, batch_end)
 
             e = BlockExtractor(K=K, radii=radii, nrotate=nrotate)
-            e.set_input(img, distmap)
+            e.set_input(img, distmap, labelmap)
             e.set_candidates(batch_candidates)
             e.set_batch_bounds(batch_start, batch_end)
 
@@ -443,7 +449,7 @@ class Patch25DB(object):
             if batch_start >= nsample_to_extract:
                 break
 
-        print('Ready to join the task queue')
+        # print('Ready to join the task queue')
         task_queue.join()
 
         for p in procs:
@@ -455,32 +461,28 @@ class Patch25DB(object):
             p.join()
 
     def _extract_worker(self, img_name, task_queue):
-        for item in iter(task_queue.get, None):
-            x, y, c, batch_start, batch_end = self._extract_process(item)
+        for extractor in iter(task_queue.get, None):
+            # Run the extraction
+            batch_start, batch_end = extractor.get_batch_bounds()
+            print('Working on ', batch_start, batch_end)
+            extractor.run()
+            print('Finished on ', batch_start, batch_end)
+            x, dist, label = extractor.get_outputs()
+            c = extractor.get_candidates()
 
+            # Save blocks to h5
             self._sema.acquire()
             self.connect(self._h5file, 'a')
-
-            # Append the blocks to hdf5
             self._db[img_name]['data']['x'][batch_start:
                                             batch_end, :, :, :, :, :] = x
-            self._db[img_name]['data']['y'][batch_start:batch_end, :] = y
+            self._db[img_name]['data']['dist'][batch_start:batch_end, :] = dist
+            self._db[img_name]['data']['label'][batch_start:batch_end, :] = label
             self._db[img_name]['data']['c'][batch_start:batch_end] = c
             task_queue.task_done()
             self.disconnect()
             self._sema.release()
 
         task_queue.task_done()
-
-    def _extract_process(self, extractor):
-        batch_start, batch_end = extractor.get_batch_bounds()
-        print('Working on ', batch_start, batch_end)
-        extractor.run()
-        print('Finished on ', batch_start, batch_end)
-        x, y = extractor.get_outputs()
-        c = extractor.get_candidates()
-
-        return x, y, c, batch_start, batch_end
 
     def _get_candidates(self, img3d):
         bimg = img3d.get_binary()
@@ -516,7 +518,6 @@ class Patch25DB(object):
                          else zero_idx.size]))
         np.random.shuffle(sample_idx)
         sample_idx = sample_idx.flatten()
-        print(sample_idx)
 
         # Claim memory for the patches
         patches = np.zeros(
@@ -662,5 +663,3 @@ if __name__ == '__main__':
         nsample=args.nsample,
         template_img=template_img,
         nthread=args.thread)
-
-    db.disconnect()
