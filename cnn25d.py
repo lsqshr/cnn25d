@@ -171,7 +171,7 @@ class Cnn25DH5(Cnn25D):
         all_train_x = []
         all_train_y = []
         for idx in trainidx:
-            x, y, _ = h5db.select_patches_from(idx, nsample_each)
+            x, y, _ = h5db.select_patches_from(idx, nsample_each, self._binary)
             all_train_x.append(x)
             all_train_y.append(y)
 

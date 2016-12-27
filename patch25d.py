@@ -226,7 +226,6 @@ class BlockExtractor(object):
         for i, (bx, by, bz) in enumerate(self._candidates):
             self._dist[i] = self._distmap.get(bx, by, bz)
             self._label[i] = self._labelmap.get(bx, by, bz)
-            
         print('%d/%d are nonzero' %
               (self._label.flatten().sum(), self._label.size))
 
@@ -494,10 +493,15 @@ class Patch25DB(object):
     def get_im_num(self):
         return len(self._db.keys())
 
-    def select_patches_from(self, idx, nsample_each):
+    def select_patches_from(self, idx, nsample_each, binary=True):
         img_names = [k for k in self._db['/'].keys()]
-        x = self._db[img_names[idx]]['data']['x']  # Total number of locations
-        y = self._db[img_names[idx]]['data']['y']  # Total number of locations
+        x = self._db[img_names[idx]]['data']['x']
+
+        if binary:
+            y = self._db[img_names[idx]]['data']['label']
+        else:
+            y = self._db[img_names[idx]]['data']['dist']
+
         c = self._db[img_names[idx]]['data']['c']  # Total number of locations
         n, nrotate, nscale, kernelsz, _, _ = x.shape
 
