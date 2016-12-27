@@ -226,10 +226,7 @@ class BlockExtractor(object):
         for i, (bx, by, bz) in enumerate(self._candidates):
             self._dist[i] = self._distmap.get(bx, by, bz)
             self._label[i] = self._labelmap.get(bx, by, bz)
-            print(i, ' Candidate at ', bx, by, bz, '\tdist:',
-                  self._dist[i], '\tlabel:',
-                  self._label[i])
-
+            
         print('%d/%d are nonzero' %
               (self._label.flatten().sum(), self._label.size))
 
