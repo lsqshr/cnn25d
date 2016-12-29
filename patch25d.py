@@ -1,6 +1,4 @@
-import time
 import math
-from tqdm import tqdm
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage.morphology import morphological_gradient, binary_dilation
@@ -8,9 +6,6 @@ import skfmm
 import h5py
 # from threading import Thread, mp.Semaphore
 import multiprocessing as mp
-import json
-
-from matplotlib import pyplot as plt
 
 
 class Image3D(object):
@@ -266,13 +261,13 @@ class BlockExtractor(object):
 
     def _sample(self, trns, imgvox):
         xy_pts = trns[0, :3, :].T
-        yz_pts = trns[0, :3, :].T
-        xz_pts = trns[0, :3, :].T
+        yz_pts = trns[1, :3, :].T
+        xz_pts = trns[2, :3, :].T
         binterp = RegularGridInterpolator(self._standard_grid, imgvox)
         return np.stack(
-            (binterp(xy_pts).reshape(self._kernelsz, self._kernelsz),
-             binterp(yz_pts).reshape(self._kernelsz, self._kernelsz),
-             binterp(xz_pts).reshape(self._kernelsz, self._kernelsz)),
+            (binterp(xy_pts).reshape((self._kernelsz, self._kernelsz)),
+             binterp(yz_pts).reshape((self._kernelsz, self._kernelsz)),
+             binterp(xz_pts).reshape((self._kernelsz, self._kernelsz))),
             axis=-1)
 
     def _init_grids(self):
@@ -396,6 +391,7 @@ class Patch25DB(object):
         img_grp = self._db.create_group(img_name)
         meta = img_grp.create_group('meta')
 
+        meta.create_dataset('shape', data=np.asarray(img._data.shape))
         meta.create_dataset('K', data=np.asarray(K).reshape(1, ))
         meta.create_dataset('radii', data=np.asarray(radii))
         meta.create_dataset('nrotate', data=np.asarray(nrotate).reshape(1, ))
@@ -491,10 +487,26 @@ class Patch25DB(object):
         return idx
 
     def get_im_num(self):
-        return len(self._db.keys())
+        return len([k for k in self._db.keys() if k != 'cache'])
+
+    def get_cached_train(self):
+        return self._db['cache']['train_x'][()], self._db['cache']['train_y'][()]
+
+    def cache_train(self, train_x, train_y):
+        if 'cache' not in self._db:
+            self._db.create_group('cache')
+
+        if 'train_x' in self._db['cache']:
+            del self._db['cache/train_x']
+
+        if 'train_y' in self._db['cache']:
+            del self._db['cache/train_y']
+
+        self._db['cache']['train_x'] = train_x
+        self._db['cache']['train_y'] = train_y
 
     def select_patches_from(self, idx, nsample_each, binary=True):
-        img_names = [k for k in self._db['/'].keys()]
+        img_names = [k for k in self._db['/'].keys() if k != 'cache']
         x = self._db[img_names[idx]]['data']['x']
 
         if binary:
@@ -511,14 +523,27 @@ class Patch25DB(object):
         nonzero_idx = np.argwhere(y_np > 0)
         np.random.shuffle(zero_idx)
         np.random.shuffle(nonzero_idx)
-        nsample_each_cls = np.floor(nsample_each / 2)
-        sample_idx = np.concatenate(
-            (zero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
-                      else zero_idx.size],
-             nonzero_idx[:nsample_each if zero_idx.size > nsample_each_cls
-                         else zero_idx.size]))
-        np.random.shuffle(sample_idx)
-        sample_idx = sample_idx.flatten()
+
+        if binary:
+            nsample_each_cls = np.floor(nsample_each / 2)
+            sample_idx = np.concatenate(
+                (zero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
+                          else zero_idx.size],
+                 nonzero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
+                             else zero_idx.size]))
+        else:
+            nsample_nonzero = np.floor(nsample_each * 2 / 4)
+            nsample_zero = np.floor(nsample_each * 2 / 4)
+            sample_idx = np.concatenate(
+                (zero_idx[:nsample_zero if zero_idx.size > nsample_zero
+                          else zero_idx.size],
+                 nonzero_idx[:nsample_nonzero if zero_idx.size > nsample_nonzero
+                             else zero_idx.size]))
+
+        # np.random.shuffle(sample_idx)
+        sample_idx = np.squeeze(sample_idx)
+        nsample_each = sample_idx.size
+        print('sample_idx', sample_idx.shape)
 
         # Claim memory for the patches
         patches = np.zeros(
@@ -527,29 +552,49 @@ class Patch25DB(object):
         groundtruth = np.zeros((nsample_each, 1))
         coords = np.zeros((nsample_each, 3))
 
-        for i, idx in enumerate(sample_idx):
-            patches[i, :, :, :, :] = x[idx, :, :, :, :]
-            groundtruth[i] = y[idx]
-            coords[i] = c[idx, :]
+        # for i, idx in enumerate(tqdm(sample_idx)):
+        sample_idx = np.sort(sample_idx)
+        patch_idx = np.arange(len(sample_idx)) 
+        patches[patch_idx, :, :, :, :] = x[sample_idx, :, :, :, :]
+        groundtruth[patch_idx, :] = y[sample_idx, :]
+        coords[patch_idx] = c[sample_idx, :]
+
+        print('Nonzeros: %d/%d' % (np.count_nonzero(groundtruth), groundtruth.size))
 
         return patches, groundtruth, coords
+
+    def get_all_patches_from(self, idx, binary=True):
+        img_names = [k for k in self._db['/'].keys() if k != 'cache']
+        x = self._db[img_names[idx]]['data']['x']
+        c = self._db[img_names[idx]]['data']['c']  # Total number of locations
+
+        if binary:
+            y = self._db[img_names[idx]]['data']['label']
+        else:
+            y = self._db[img_names[idx]]['data']['dist']
+        
+        return x, y, c            
+
+    def get_im_shape(self, idx):
+        img_names = [k for k in self._db['/'].keys() if k != 'cache']
+        shape = self._db[img_names[idx]]['meta']['shape']
+        return shape
 
 
 def flatten_blocks(x, y=None):
     # Transform the blocks to nsample*NROTATION X K X K X 3*NSCALE
     nsample, nrotate, nscale, kernelsz, _, _ = x.shape
-    xnew = np.zeros((nsample * nrotate, kernelsz, kernelsz, 3 * nscale))
+    xnew = np.zeros((nsample * nrotate * nscale, kernelsz, kernelsz, 3))
 
     if y is not None:
         # Assign value y to each observation
-        y = np.tile(y, (1, nrotate))
-        y = y.reshape((nsample * nrotate, 1))
+        y = np.tile(y, (1, nrotate * nscale))
+        y = y.reshape((nsample * nrotate * nscale, 1))
 
     for i in range(nsample):
         for j in range(nrotate):
             for z in range(nscale):
-                xnew[i * nrotate + j, :, :, z * 3:z * 3 + 3] = x[i, j,
-                                                                 z, :, :, :]
+                xnew[i * nrotate + j * nscale + z, :, :, :] = x[i, j, z, :, :, :]
 
     if y is not None:
         return xnew, y
@@ -633,9 +678,9 @@ if __name__ == '__main__':
         help="Size of the batch to write h5 file. Default 1000")
 
     args = parser.parse_args()
-    K = 7
-    RADII = [7, 9, 11, 13, 15]
-    NROTATE = 3
+    K = 13
+    RADII = [9, 11, 13, 15, 17]
+    NROTATE = 5
 
     # Extract 2.5D Blocks
     db = Patch25DB(args.batch_size)
@@ -660,7 +705,7 @@ if __name__ == '__main__':
         threshold=args.threshold,
         K=K,
         radii=RADII,
-        nrotate=3,
+        nrotate=NROTATE,
         nsample=args.nsample,
         template_img=template_img,
         nthread=args.thread)
