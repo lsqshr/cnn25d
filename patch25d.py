@@ -4,8 +4,9 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage.morphology import morphological_gradient, binary_dilation
 import skfmm
 import h5py
-# from threading import Thread, mp.Semaphore
 import multiprocessing as mp
+from matplotlib import pyplot as plt
+from mpl_toolkits.mplot3d import axes3d
 
 
 class Image3D(object):
@@ -199,7 +200,7 @@ class BlockExtractor(object):
         imgvox = self._bimg3d.get_data()
 
         # Claim the memory for all 2.5D blocks
-        self._blocks = np.zeros(shape=(nsample, self._nrotate,
+        self._blocks = np.zeros(shape=(nsample, max(self._nrotate, 1),
                                        len(self._radii), 2 * self._K + 1,
                                        2 * self._K + 1, 3))
         self._dist = np.zeros((nsample, 1))
@@ -221,32 +222,42 @@ class BlockExtractor(object):
         for i, (bx, by, bz) in enumerate(self._candidates):
             self._dist[i] = self._distmap.get(bx, by, bz)
             self._label[i] = self._labelmap.get(bx, by, bz)
-        print('%d/%d are nonzero' %
-              (self._label.flatten().sum(), self._label.size))
+        # print('%d/%d are nonzero' %
+        #       (self._label.flatten().sum(), self._label.size))
 
-        # Start extracting blocks
-        for r in range(self._nrotate):
-            # Rotation Transform
-            rot_trns_grid = base_flatten_grid.copy()
-            rx, ry, rz = self._make_rotation_transform(
-                np.random.rand() * 2 * np.pi,
-                np.random.rand() * 2 * np.pi, np.random.rand() * 2 * np.pi)
-            rot_trns_grid = self._apply_transform(rot_trns_grid, rx)
-            rot_trns_grid = self._apply_transform(rot_trns_grid, ry)
-            rot_trns_grid = self._apply_transform(rot_trns_grid, rz)
+        for s in range(len(self._radii)):
+            # Scale transform
+            scale_trns_grid = base_flatten_grid.copy()
+            rs = self._make_scale_transform(self._radii[s] / self._K)
+            scale_trns_grid = self._apply_transform(scale_trns_grid, rs)
+            # self.plot_grids(scale_trns_grid, 'After scale %f' % (self._radii[s] / self._K))
+            # Start extracting blocks
+            for r in range(max(self._nrotate, 1)):
+                # Rotation Transform
+                rot_trns_grid = scale_trns_grid.copy()
 
-            for s in range(len(self._radii)):
-                # Scale transform
-                scale_trns_grid = rot_trns_grid.copy()
-                rs = self._make_scale_transform(self._radii[s] / self._K)
-                scale_trns_grid = self._apply_transform(scale_trns_grid, rs)
+                # Skip the rotation if nrotate is 0
+                if self._nrotate != 0:
+                    x_angle = np.random.rand() * 2 * np.pi
+                    y_angle = np.random.rand() * 2 * np.pi
+                    z_angle = np.random.rand() * 2 * np.pi
+                    rx, ry, rz = self._make_rotation_transform(x_angle, y_angle,
+                                                               z_angle)
+                    # print('Trying to rotate', x_angle, y_angle, z_angle)
+                    rot_trns_grid = self._apply_transform(rot_trns_grid, rx)
+                    rot_trns_grid = self._apply_transform(rot_trns_grid, ry)
+                    rot_trns_grid = self._apply_transform(rot_trns_grid, rz)
+                    # self.plot_grids(rot_trns_grid, 'After rotate %f, %f, %f' %
+                                    # (x_angle, y_angle, z_angle))
+
                 for i in range(nsample):
                     # Spatial Transform
                     bx, by, bz = self._candidates[i, :]
-                    trans_trns_grid = scale_trns_grid.copy()
+                    trans_trns_grid = rot_trns_grid.copy()
                     rt = self._make_translation_transform(bx, by, bz)
                     trans_trns_grid = self._apply_transform(trans_trns_grid,
                                                             rt)
+                    # self.plot_grids(trans_trns_grid, 'After trans %f,%f,%f' % (bx,by,bz))
 
                     # Sample the 2.5D block with the current grids
                     self._blocks[i, r, s, :, :, :] = self._sample(
@@ -290,6 +301,19 @@ class BlockExtractor(object):
                               [grid_yz_x, grid_yz_y, grid_yz_z],
                               [grid_xz_x, grid_xz_y, grid_xz_z]]
         self._grids = self._grids_backup.copy()
+
+    def plot_grids(self, grids, title):
+        '''
+        Plot the grids to debug the transformation code
+        '''
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        for g in grids:
+            ax.scatter(g[0], g[1], g[2])
+        plt.title(title)
+
+        plt.show()
+
 
     def _apply_transform(self, flatten_grid, trns):
         result_grid = np.zeros((flatten_grid.shape))
@@ -371,13 +395,14 @@ class Patch25DB(object):
         if template_img is not None:
             print('Normalising intensity...')
             img.gradient_based_normalise(template_img)
-        img.pad(max(radii) * 2)
+        img.pad(max(radii) * 3)
 
         print('Making Distance Transform Map...')
         distmap = DistanceMap3D(swc, imgvox.shape, binary=False)
-        distmap.pad(max(radii) * 2)
+        distmap.pad(max(radii) * 3)
+
         labelmap = DistanceMap3D(swc, imgvox.shape, binary=True)
-        labelmap.pad(max(radii) * 2)
+        labelmap.pad(max(radii) * 3)
 
 
         print('Extracting 2.5D blocks from %s' % img_name)
@@ -398,7 +423,7 @@ class Patch25DB(object):
         meta.create_dataset(
             'nsample', data=np.asarray(nsample_to_extract).reshape(1, ))
         data_grp = img_grp.create_group('data')
-        data_grp.create_dataset('x', (nsample_to_extract, nrotate, len(radii),
+        data_grp.create_dataset('x', (nsample_to_extract, max(nrotate, 1), len(radii),
                                       2 * K + 1, 2 * K + 1, 3))
         data_grp.create_dataset('dist', (nsample_to_extract, 1))
         data_grp.create_dataset('label', (nsample_to_extract, 1))
@@ -532,8 +557,8 @@ class Patch25DB(object):
                  nonzero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
                              else zero_idx.size]))
         else:
-            nsample_nonzero = np.floor(nsample_each * 2 / 4)
-            nsample_zero = np.floor(nsample_each * 2 / 4)
+            nsample_nonzero = np.floor(nsample_each * 1 / 4)
+            nsample_zero = np.floor(nsample_each * 3 / 4)
             sample_idx = np.concatenate(
                 (zero_idx[:nsample_zero if zero_idx.size > nsample_zero
                           else zero_idx.size],
@@ -573,7 +598,7 @@ class Patch25DB(object):
         else:
             y = self._db[img_names[idx]]['data']['dist']
         
-        return x, y, c            
+        return x, y, c
 
     def get_im_shape(self, idx):
         img_names = [k for k in self._db['/'].keys() if k != 'cache']
@@ -588,7 +613,8 @@ def flatten_blocks(x, y=None):
 
     if y is not None:
         # Assign value y to each observation
-        y = np.tile(y, (1, nrotate * nscale))
+        y = np.tile(y.reshape((y.size, 1)), (1, nrotate * nscale))
+        print('y shape after tile: ', y.shape)
         y = y.reshape((nsample * nrotate * nscale, 1))
 
     for i in range(nsample):
@@ -677,10 +703,27 @@ if __name__ == '__main__':
         default=1000,
         help="Size of the batch to write h5 file. Default 1000")
 
+    parser.add_argument(
+        '--nrotate',
+        type=int,
+        default=1,
+        help="Size of the batch to write h5 file. Default 1")
+
+    parser.add_argument(
+        '--radii',
+        type=int,
+        nargs='+',
+        default=[5, 7, 9],
+        help="The radii to sample 2.5D patches. Default [5,7,9]")
+
+    parser.add_argument(
+        '-k',
+        '--kernel_radius',
+        type=int,
+        default=7,
+        help="The radius of the sampled patch. Default 7")
+
     args = parser.parse_args()
-    K = 13
-    RADII = [9, 11, 13, 15, 17]
-    NROTATE = 5
 
     # Extract 2.5D Blocks
     db = Patch25DB(args.batch_size)
@@ -703,9 +746,9 @@ if __name__ == '__main__':
         imgvox,
         swc,
         threshold=args.threshold,
-        K=K,
-        radii=RADII,
-        nrotate=NROTATE,
+        K=args.kernel_radius,
+        radii=args.radii,
+        nrotate=args.nrotate,
         nsample=args.nsample,
         template_img=template_img,
         nthread=args.thread)

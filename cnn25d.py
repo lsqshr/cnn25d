@@ -14,6 +14,8 @@ from patch25d import *
 from rivuletpy.utils.io import *
 import argparse
 
+from matplotlib import pyplot as plt
+
 
 def _make_cnn(in_shape, binary=True, optimizer='rmsprop'):
     '''
@@ -33,20 +35,22 @@ def _make_cnn(in_shape, binary=True, optimizer='rmsprop'):
     model.add(ELU())
     model.add(MaxPooling2D(pool_size=(2, 2), dim_ordering='tf'))
     # model.add(GaussianNoise(1))
-    # model.add(GaussianDropout(0.5))
+    model.add(GaussianDropout(0.25))
     model.add(Convolution2D(64, 3, 3, border_mode='same'))
     model.add(BatchNormalization())
     model.add(ELU())
     model.add(MaxPooling2D(pool_size=(2, 2), dim_ordering='tf'))
     # model.add(GaussianNoise(1))
-    # model.add(GaussianDropout(0.5))
+    model.add(GaussianDropout(0.25))
     model.add(Flatten())
     model.add(Dense(128))
     model.add(BatchNormalization())
     model.add(ELU())
+    model.add(GaussianDropout(0.25))
     model.add(Dense(128))
     model.add(BatchNormalization())
     model.add(ELU())
+    model.add(GaussianDropout(0.25))
 
     if not binary:
         model.add(Dense(1))
@@ -81,9 +85,7 @@ class Cnn25D(object):
                 y_act[i, math.floor(gidx)] = 1
             y = y_act
         else:
-            # y = self.normalize_feats(y)
-            # y = y / y.max()
-            pass
+            y = y / y.max()
 
         x = self.normalize_feats(x)
 
@@ -107,22 +109,23 @@ class Cnn25D(object):
         return self._model.predict(x)
 
     def im_predict(self, x, idx, shape):
+        # x = x.astype('float32')
         im = np.zeros(shape)
         if x.ndim == 4:
             p = self.predict(x)
         elif x.ndim == 6:
             nsample, nrotate, nscale, kernelsz, _, _ = x.shape
             x = flatten_blocks(x, None)
+            # x = self.normalize_feats(x)
             p = self.predict(x)
             p = p.reshape((nsample, nrotate * nscale))
-            p = p.mean(axis=-1)
+            if p.shape[1] >= 2:
+                p = p.mean(axis=-1)
 
             if self._binary:
                 p = p.argmax(axis=-1)
                 p = p > 0.5
 
-        print('== p:', p.shape, 'idx:', idx.shape)
-        print('Writting prediction to image matrix')
         for i in tqdm(range(idx.shape[0])):
             im[math.floor(idx[i, 0]), math.floor(idx[i, 1]), math.floor(idx[i, 2])] = p[i]
 
@@ -140,6 +143,7 @@ class Cnn25D(object):
         self._model = model
 
     def load_model_from_h5(self, h5path):
+        print('Loading model from h5path')
         self._model = load_model(h5path)
 
     def plot_history(self):
@@ -208,7 +212,7 @@ class Cnn25DH5(Cnn25D):
             # Shuffle the indices
             random_idx = np.arange(train_y.shape[0])
             np.random.shuffle(random_idx)
-            train_x = np.squeeze(train_x[random_idx, :, :, :, :, :])
+            train_x = train_x[random_idx, :, :, :, :, :]
             train_y = np.squeeze(train_y[random_idx, :])
             h5db.cache_train(train_x, train_y)
 
@@ -315,22 +319,37 @@ if __name__ == '__main__':
         im = cnn.im_predict_from_h5(h5db, 0,
                                model_path=None if args.train else args.model_cache)
 
-        from matplotlib import pyplot as plt
-        # writetiff3d('predicted.tif' if args.predicted_path is None else args.predicted_path,
-        #             (im * 150).astype('uint8'))
-        f, ax = plt.subplots(1,2)
+        im2save = im.copy()
+        im2save[im2save < 0] = 0
+        im2save[im2save > 0.5] = 0.5
+        im2save /= im2save.max()
+        im2save *= 150
+        writetiff3d('predicted.tif' if args.predicted_path is None else args.predicted_path,
+                    im2save.astype('uint8'))
+
+
+        f, ax = plt.subplots(1, 2)
         ax[0].imshow(im.max(-1))
-        ax[1].imshow(im.max(-1) > 0.01)
+        ax[0].set_title('predicted')
+        ax[1].imshow(im.max(-1) > 0)
+        ax[1].set_title('region')
         plt.show()
 
     if args.test:
-        im = cnn.im_predict_from_h5(h5db, args.test_idx,
+        im = cnn.im_predict_from_h5(h5db, 0,
                                model_path=None if args.train else args.model_cache)
 
-        from matplotlib import pyplot as plt
+        im2save = im.copy()
+        im2save[im2save < 0] = 0
+        im2save[im2save > 0.5] = 0.5
+        im2save /= im2save.max()
+        im2save *= 150
         writetiff3d('predicted.tif' if args.predicted_path is None else args.predicted_path,
-                    (im * 150).astype('uint8'))
-        f, ax = plt.subplots(1,2)
+                    im2save.astype('uint8'))
+
+        f, ax = plt.subplots(1, 2)
         ax[0].imshow(im.max(-1))
-        ax[1].imshow(im.max(-1) > 0.01)
+        ax[0].set_title('predicted')
+        ax[1].imshow(im.max(-1) > 0)
+        ax[1].set_title('region')
         plt.show()
