@@ -115,6 +115,15 @@ class Image3D(object):
                     break
         return ctable
 
+    def chunk(self, centre, size):
+        '''
+        Chunk the image by given a 3D centre and a size of the chunk
+        Assume the image has been zero padded
+        '''
+        cx, cy, cz = centre
+        rx, ry, rz = [math.floor(s/2) for s in size]
+        self._data = self._data[cx-rx:cx+rx+1, cy-ry:cy+ry+1, cz-rz:cz+rz+1]
+
 
 def _cdf(h):
     c = np.cumsum(h)
@@ -378,8 +387,9 @@ class Patch25DB(object):
 
     def im_extract(self,
                    img_name,
-                   imgvox,
-                   swc,
+                   img=None,
+                   labelmap=None,
+                   distmap=None,
                    threshold=0,
                    K=7,
                    radii=[7, 9, 11],
@@ -390,20 +400,6 @@ class Patch25DB(object):
                    sema=None):
 
         # Pad Image
-        img = Image3D(imgvox)
-        img.binarize(threshold)
-        if template_img is not None:
-            print('Normalising intensity...')
-            img.gradient_based_normalise(template_img)
-        img.pad(max(radii) * 3)
-
-        print('Making Distance Transform Map...')
-        distmap = DistanceMap3D(swc, imgvox.shape, binary=False)
-        distmap.pad(max(radii) * 3)
-
-        labelmap = DistanceMap3D(swc, imgvox.shape, binary=True)
-        labelmap.pad(max(radii) * 3)
-
 
         print('Extracting 2.5D blocks from %s' % img_name)
         # Calls BlockExtractor
@@ -646,6 +642,20 @@ if __name__ == '__main__':
         help='The input file. A image file (*.tif, *.nii, *.mat). ')
 
     parser.add_argument(
+        '--distmap',
+        type=str,
+        default=None,
+        required=False,
+        help='The distance map file in .npy. ')
+
+    parser.add_argument(
+        '--labelmap',
+        type=str,
+        default=None,
+        required=False,
+        help='The label map file in .npy. ')
+
+    parser.add_argument(
         '-o',
         '--h5',
         type=str,
@@ -735,16 +745,43 @@ if __name__ == '__main__':
 
     print('Loading image file', args.file)
     imgvox = loadimg(args.file)
-    swc = loadswc(args.swc)
+
+    if args.swc is not None:
+        swc = loadswc(args.swc)
 
     if args.zoom_factor != 1.:
         imgvox = zoom(imgvox, args.zoom_factor)
-        swc[:, 2:5] *= args.zoom_factor
+
+        if args.swc is not None:
+            swc[:, 2:5] *= args.zoom_factor
+
+    img = Image3D(imgvox)
+    img.binarize(args.threshold)
+    if template_img is not None:
+        print('Normalising intensity...')
+        img.gradient_based_normalise(template_img)
+    img.pad(max(args.radii) * 3)
+
+    print('Making Distance Transform Map...')
+    if args.swc is None:
+
+        if args.distmap is None or args.labelmap is None:
+            raise Exception('SWC file not provided, thus both distmap and labelmap should be provided in .npy files')
+
+        distmap = Image3D(np.load(args.distmap))
+        labelmap = Image3D(np.load(args.labelmap))
+    else:
+        distmap = DistanceMap3D(swc, imgvox.shape, binary=False)
+        labelmap = DistanceMap3D(swc, imgvox.shape, binary=True)
+
+    distmap.pad(max(args.radii) * 3)
+    labelmap.pad(max(args.radii) * 3)
 
     db.im_extract(
         os.path.split(args.file)[1],
-        imgvox,
-        swc,
+        img,
+        distmap,
+        labelmap,
         threshold=args.threshold,
         K=args.kernel_radius,
         radii=args.radii,
