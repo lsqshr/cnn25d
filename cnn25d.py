@@ -195,8 +195,8 @@ class Cnn25DH5(Cnn25D):
 
             train_x = []
             train_y = []
-            for idx in trainidx:
-                print('== Collect patches from image %d/%d' % (idx, len(trainidx)))
+            for i,idx in enumerate(trainidx):
+                print('== Collect patches from image %d/%d' % (i, len(trainidx)))
                 x, y, _ = h5db.select_patches_from(idx, nsample_each, self._binary)
                 train_x.append(x)
                 train_y.append(y)
