@@ -13,6 +13,9 @@ class Image3D(object):
     def __init__(self, data=None):
         self._data = data
         self._binary = None
+    
+    def copy(self):
+        return Image3D(self._data.copy())
 
     def pad(self, margin):
         pimg = np.zeros((self._data.shape[0] + 2 * margin,
@@ -723,7 +726,7 @@ if __name__ == '__main__':
         '--radii',
         type=int,
         nargs='+',
-        default=[5, 7, 9],
+        default=[7],
         help="The radii to sample 2.5D patches. Default [5,7,9]")
 
     parser.add_argument(

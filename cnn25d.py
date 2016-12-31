@@ -189,7 +189,6 @@ class Cnn25DH5(Cnn25D):
             trainidx = [i for i in range(nimg)]
             trainidx = [i for i in trainidx if i not in testidx]
 
-            print(testidx)
             if any([t > nimg - 1 for t in testidx]) and (len(testidx) == 1 and
                                                          testidx[0] != -1):
                 raise Exception('There are one or more test idx out of bound')
@@ -197,7 +196,7 @@ class Cnn25DH5(Cnn25D):
             train_x = []
             train_y = []
             for idx in trainidx:
-                print('== Collect patches from image ', idx)
+                print('== Collect patches from image %d/%d' % (idx, len(trainidx)))
                 x, y, _ = h5db.select_patches_from(idx, nsample_each, self._binary)
                 train_x.append(x)
                 train_y.append(y)
@@ -280,6 +279,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--test_idx',
         type=int,
+        nargs='+',
         default=-1,
         help='''Which image is left for testing.
                 Default 0.''')
@@ -287,6 +287,9 @@ if __name__ == '__main__':
     # Arguments for soma detection
     parser.add_argument('--train', dest='train', action='store_true')
     parser.set_defaults(train=False)
+
+    parser.add_argument('--no-plot', dest='plot', action='store_false')
+    parser.set_defaults(plot=True)
 
     # Arguments for soma detection
     parser.add_argument('--test', dest='test', action='store_true')
@@ -307,49 +310,34 @@ if __name__ == '__main__':
     if args.train:
         cnn.simple_train_h5(
             h5db,
-            [args.test_idx, ],
+            args.test_idx,
             nsample_each=args.nsample_each,
             nepoch=args.epoch,
             model_path=args.model_cache,
             optimizer='rmsprop',
             use_cache=args.cache)
-        cnn.plot_history()
-
-        # DEBUG
-        im = cnn.im_predict_from_h5(h5db, 0,
-                               model_path=None if args.train else args.model_cache)
-
-        im2save = im.copy()
-        im2save[im2save < 0] = 0
-        im2save[im2save > 0.5] = 0.5
-        im2save /= im2save.max()
-        im2save *= 150
-        writetiff3d('predicted.tif' if args.predicted_path is None else args.predicted_path,
-                    im2save.astype('uint8'))
-
-
-        f, ax = plt.subplots(1, 2)
-        ax[0].imshow(im.max(-1))
-        ax[0].set_title('predicted')
-        ax[1].imshow(im.max(-1) > 0)
-        ax[1].set_title('region')
-        plt.show()
+        if args.plot:
+            cnn.plot_history()
 
     if args.test:
-        im = cnn.im_predict_from_h5(h5db, 0,
-                               model_path=None if args.train else args.model_cache)
+        for tidx in args.test_idx:
+            im = cnn.im_predict_from_h5(h5db, tidx,
+                                   model_path=None if args.train else args.model_cache)
 
-        im2save = im.copy()
-        im2save[im2save < 0] = 0
-        im2save[im2save > 0.5] = 0.5
-        im2save /= im2save.max()
-        im2save *= 150
-        writetiff3d('predicted.tif' if args.predicted_path is None else args.predicted_path,
-                    im2save.astype('uint8'))
+            im2save = im.copy()
+            im2save[im2save < 0.25] = 0
+            # im2save[im2save > 0.5] = 0.5
+            im2save /= im2save.max()
+            im2save *= 200
+            writetiff3d('predicted.%d.tif' % tidx if args.predicted_path is None else args.predicted_path + '.' + str(tidx) + '.tif',
+                        im2save.astype('uint8'))
 
-        f, ax = plt.subplots(1, 2)
-        ax[0].imshow(im.max(-1))
-        ax[0].set_title('predicted')
-        ax[1].imshow(im.max(-1) > 0)
-        ax[1].set_title('region')
+            if args.plot:
+                f, ax = plt.subplots(1, 2)
+                ax[0].imshow(im.max(-1))
+                ax[0].set_title('predicted')
+                ax[1].imshow(im.max(-1) > 0)
+                ax[1].set_title('region')
+
+    if args.plot:
         plt.show()

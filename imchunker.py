@@ -1,19 +1,19 @@
-import os
 import math
 import numpy as np
+from scipy.ndimage.interpolation import zoom
 from patch25d import Image3D, DistanceMap3D
-from rivuletpy.utils.io import *
+from rivuletpy.utils.io import loadswc, loadimg, writetiff3d
 import argparse
 
 
 def im_auto_chunk(img,
                   distmap,
                   labelmap,
-                  threshold=0,
                   nchunk=3,
                   size=[100, 100, 50],
                   prefix='chunk'):
-    bimg = img._data > 0
+    print('Working on: ', prefix)
+    bimg = distmap._data > 0
 
     # Randomly choose a centre that is inside the central region
     central_region = np.zeros(bimg.shape)
@@ -27,30 +27,39 @@ def im_auto_chunk(img,
     idx = np.argwhere(bimg)
     idx2sample = idx[np.random.randint(0, idx.shape[0], (nchunk, )), :]
 
-    for i, p in enumerate(idx2sample):
-        img, distmap, labelmap = im_chunk(img, distmap, labelmap, p, size)
+    size = np.asarray(size)
+    pad_margin = size.max()
 
-        # Save image to tiff
-        writetiff3d(prefix + '.img.%d.tif' % i, img._data.astype('uint8'))
-        np.save(prefix + '.dist.%d.npy' % i, distmap._data)
-        np.save(prefix + '.label.%d.npy' % i, labelmap._data)
-
-
-def im_chunk(img, distmap, labelmap, centre, size):
-    pad_margin = (np.floor(np.asarray(size) / 2) + np.asarray(centre) - np.asarray(imgvox.shape)).max()
     if pad_margin > 0:
         img.pad(pad_margin)
         distmap.pad(pad_margin)
         labelmap.pad(pad_margin)
 
-    img.chunk(args.centre, args.size)
-    distmap.chunk(args.centre, args.size)
-    labelmap.chunk(args.centre, args.size)
+    for i, p in enumerate(idx2sample):
+        centre = np.asarray(p)
+        centre += pad_margin
 
-    if pad_margin > 0:
-        img.unpad(pad_margin)
-        distmap.unpad(pad_margin)
-        labelmap.unpad(pad_margin)
+        img_chunked, distmap_chunked, labelmap_chunked = im_chunk(
+            img, distmap, labelmap, centre, size)
+
+        # Save image to tiff
+        print('Saving to', prefix + '.img.%d.tif' % i)
+        writetiff3d(prefix + '.img.%d.tif' % i, img_chunked._data.astype('uint8'))
+        np.save(prefix + '.dist.%d.npy' % i, distmap_chunked._data)
+        np.save(prefix + '.label.%d.npy' % i, labelmap_chunked._data)
+
+
+def im_chunk(img, distmap, labelmap, centre, size):
+
+    img_chunked = img.copy()
+    distmap_chunked = distmap.copy()
+    labelmap_chunked = labelmap.copy()
+
+    img_chunked.chunk(centre, size)
+    distmap_chunked.chunk(centre, size)
+    labelmap_chunked.chunk(centre, size)
+
+    return img_chunked, distmap_chunked, labelmap_chunked
 
 
 if __name__ == '__main__':
@@ -100,11 +109,12 @@ if __name__ == '__main__':
                 Default [100, 100, 50]''')
 
     parser.add_argument(
-        '-t',
-        '--threshold',
-        type=int,
-        default=0,
-        help='Threshold to select candidate')
+        '-z',
+        '--zoom_factor',
+        type=float,
+        default=1.,
+        help='''The factor to zoom the image to speed up the whole thing.
+                Default 1.''')
 
     parser.add_argument(
         '-n',
@@ -115,12 +125,19 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+
     # Load and chunk the image
     imgvox = loadimg(args.file)
+    swc = loadswc(args.swc)
+
+    if args.zoom_factor != 1.:
+        imgvox = zoom(imgvox, args.zoom_factor)
+
+        if args.swc is not None:
+            swc[:, 2:5] *= args.zoom_factor
     img = Image3D(imgvox)
     size = np.asarray(args.size)
 
-    swc = loadswc(args.swc)
     distmap = DistanceMap3D(swc, imgvox.shape, binary=False)
     labelmap = DistanceMap3D(swc, imgvox.shape, binary=True)
 
@@ -133,5 +150,5 @@ if __name__ == '__main__':
         np.save(prefix + '.dist.npy', distmap._data)
         np.save(prefix + '.label.npy', labelmap._data)
     else:
-        im_auto_chunk(img, distmap, labelmap, args.threshold, args.nchunk, args.size,
+        im_auto_chunk(img, distmap, labelmap, args.nchunk, args.size,
                       args.output_prefix)
