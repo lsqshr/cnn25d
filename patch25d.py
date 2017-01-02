@@ -7,13 +7,15 @@ import h5py
 import multiprocessing as mp
 from matplotlib import pyplot as plt
 from mpl_toolkits.mplot3d import axes3d
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+# from mayavi.mlab import contour3d
 
 
 class Image3D(object):
     def __init__(self, data=None):
         self._data = data
         self._binary = None
-    
+
     def copy(self):
         return Image3D(self._data.copy())
 
@@ -124,8 +126,9 @@ class Image3D(object):
         Assume the image has been zero padded
         '''
         cx, cy, cz = centre
-        rx, ry, rz = [math.floor(s/2) for s in size]
-        self._data = self._data[cx-rx:cx+rx+1, cy-ry:cy+ry+1, cz-rz:cz+rz+1]
+        rx, ry, rz = [math.floor(s / 2) for s in size]
+        self._data = self._data[cx - rx:cx + rx + 1, cy - ry:cy + ry + 1, cz -
+                                rz:cz + rz + 1]
 
 
 def _cdf(h):
@@ -153,7 +156,8 @@ class DistanceMap3D(Image3D):
             dvox = np.floor(np.linalg.norm(dvec))
             if dvox >= 1:
                 uvec = dvec / (dvox + 1)
-                extra_nodes.extend([cnode + uvec * i for i in range(1, int(dvox))])
+                extra_nodes.extend(
+                    [cnode + uvec * i for i in range(1, int(dvox))])
 
         # Deal with nodes in swc
         for i in range(swc.shape[0]):
@@ -177,9 +181,9 @@ class DistanceMap3D(Image3D):
             self._data = dt
 
 
-class BlockExtractor(object):
-    def __init__(self, K=7, radii=(7, 11, 15), nrotate=1):
-        super(BlockExtractor, self).__init__()
+class Patch25DExtractor(object):
+    def __init__(self, K=7, radii=(7), nrotate=1):
+        super(Patch25DExtractor, self).__init__()
         self._K = K  # Block Radius
         self._kernelsz = 2 * K + 1
         self._radii = radii  # Radii to sample at each location
@@ -225,7 +229,7 @@ class BlockExtractor(object):
         # The grid used below this are all flatten for speed
         base_flatten_grid = np.zeros((3, 4, self._grids[0][0].size))
 
-        for i in range(3):
+        for i in range(len(self._grids)):
             base_flatten_grid[i, :, :] = np.stack(
                 (self._grids[i][0].flatten(), self._grids[i][1].flatten(),
                  self._grids[i][2].flatten(), np.ones(self._grids[0][0].size)))
@@ -234,15 +238,13 @@ class BlockExtractor(object):
         for i, (bx, by, bz) in enumerate(self._candidates):
             self._dist[i] = self._distmap.get(bx, by, bz)
             self._label[i] = self._labelmap.get(bx, by, bz)
-        # print('%d/%d are nonzero' %
-        #       (self._label.flatten().sum(), self._label.size))
 
         for s in range(len(self._radii)):
             # Scale transform
             scale_trns_grid = base_flatten_grid.copy()
             rs = self._make_scale_transform(self._radii[s] / self._K)
             scale_trns_grid = self._apply_transform(scale_trns_grid, rs)
-            # self.plot_grids(scale_trns_grid, 'After scale %f' % (self._radii[s] / self._K))
+
             # Start extracting blocks
             for r in range(max(self._nrotate, 1)):
                 # Rotation Transform
@@ -253,14 +255,11 @@ class BlockExtractor(object):
                     x_angle = np.random.rand() * 2 * np.pi
                     y_angle = np.random.rand() * 2 * np.pi
                     z_angle = np.random.rand() * 2 * np.pi
-                    rx, ry, rz = self._make_rotation_transform(x_angle, y_angle,
-                                                               z_angle)
-                    # print('Trying to rotate', x_angle, y_angle, z_angle)
+                    rx, ry, rz = self._make_rotation_transform(
+                        x_angle, y_angle, z_angle)
                     rot_trns_grid = self._apply_transform(rot_trns_grid, rx)
                     rot_trns_grid = self._apply_transform(rot_trns_grid, ry)
                     rot_trns_grid = self._apply_transform(rot_trns_grid, rz)
-                    # self.plot_grids(rot_trns_grid, 'After rotate %f, %f, %f' %
-                                    # (x_angle, y_angle, z_angle))
 
                 for i in range(nsample):
                     # Spatial Transform
@@ -269,7 +268,6 @@ class BlockExtractor(object):
                     rt = self._make_translation_transform(bx, by, bz)
                     trans_trns_grid = self._apply_transform(trans_trns_grid,
                                                             rt)
-                    # self.plot_grids(trans_trns_grid, 'After trans %f,%f,%f' % (bx,by,bz))
 
                     # Sample the 2.5D block with the current grids
                     self._blocks[i, r, s, :, :, :] = self._sample(
@@ -319,17 +317,15 @@ class BlockExtractor(object):
         Plot the grids to debug the transformation code
         '''
         fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
+        ax = fig.gca(projection='3d')
         for g in grids:
-            ax.scatter(g[0], g[1], g[2])
+            ax.scatter(g[0], g[1], g[2], s=5, c='r')
         plt.title(title)
-
         plt.show()
-
 
     def _apply_transform(self, flatten_grid, trns):
         result_grid = np.zeros((flatten_grid.shape))
-        for i in range(3):
+        for i in range(result_grid.shape[0]):
             result_grid[i][:] = flatten_grid[i][:].T.dot(trns).T
         return result_grid
 
@@ -370,6 +366,78 @@ class BlockExtractor(object):
         return rt
 
 
+class HEX25DExtractor(Patch25DExtractor):
+    '''
+    Hex 2.5D Patch Extractor
+
+    Each of TF observation consists of 9X2D patches (3 Sets).
+    Each set of 2D patches are pi/3 away from each other 
+    '''
+
+    # Override _init_grids to make Hex 2.5D patches
+    def _init_grids(self):
+        width = 2 * self._K + 1
+
+        x = np.linspace(-self._K, self._K + 1, width)
+        y = np.linspace(-self._K, self._K + 1, width)
+        z = np.linspace(-self._K, self._K + 1, width)
+
+        # Make Horizontal Grid on XY plane
+        grid_xy_x, grid_xy_y, grid_xy_z = np.meshgrid(x, y, 0)
+
+        # Make Vertical on YZ plane
+        grid_yz_x, grid_yz_y, grid_yz_z = np.meshgrid(0, y, z)
+
+        # Make Vertical on XZ plane
+        grid_xz_x, grid_xz_y, grid_xz_z = np.meshgrid(x, 0, z)
+
+        # Rotate XY Grid pi/3 according to X axis
+        grid_xy_x1, grid_xy_y1, grid_xy_z1 = self._rotate_2d_grid(
+            grid_xy_x, grid_xy_y, grid_xy_z, np.pi / 4, 0., 0.)
+
+        # Rotate XY Grid -pi/3 according to X axis
+        grid_xy_x2, grid_xy_y2, grid_xy_z2 = self._rotate_2d_grid(
+            grid_xy_x, grid_xy_y, grid_xy_z, -np.pi / 4, 0., 0.)
+
+        # Rotate YZ Grid pi/3 according to Y axis
+        grid_yz_x1, grid_yz_y1, grid_yz_z1 = self._rotate_2d_grid(
+            grid_yz_x, grid_yz_y, grid_yz_z, 0., np.pi / 4, 0.)
+
+        # Rotate YZ Grid -pi/3 according to Y axis
+        grid_yz_x2, grid_yz_y2, grid_yz_z2 = self._rotate_2d_grid(
+            grid_yz_x, grid_yz_y, grid_yz_z, 0., -np.pi / 4, 0.)
+
+        # Rotate XZ grid pi/3 according to Z axis
+        grid_xz_x1, grid_xz_y1, grid_xz_z1 = self._rotate_2d_grid(
+            grid_xz_x, grid_xz_y, grid_xz_z, 0., 0., np.pi / 4)
+
+        # Rotate XZ grid -pi/3 according to Z axis
+        grid_xz_x2, grid_xz_y2, grid_xz_z2 = self._rotate_2d_grid(
+            grid_xz_x, grid_xz_y, grid_xz_z, 0., 0., -np.pi / 4)
+
+        self._grids_backup = [[grid_xy_x, grid_xy_y, grid_xy_z],
+                              [grid_xy_x1, grid_xy_y1, grid_xy_z1],
+                              [grid_xy_x2, grid_xy_y2, grid_xy_z2],
+                              [grid_yz_x, grid_yz_y, grid_yz_z],
+                              [grid_yz_x1, grid_yz_y1, grid_yz_z1],
+                              [grid_yz_x2, grid_yz_y2, grid_yz_z2],
+                              [grid_xz_x, grid_xz_y, grid_xz_z],
+                              [grid_xz_x1, grid_xz_y1, grid_xz_z1],
+                              [grid_xz_x2, grid_xz_y2, grid_xz_z2]]
+        self._grids = self._grids_backup.copy()
+
+    def _rotate_2d_grid(self, grid_x, grid_y, grid_z, angle_x, angle_y,
+                        angle_z):
+        rx, ry, rz = self._make_rotation_transform(angle_x, angle_y, angle_z)
+        flatten_grid = np.stack((grid_x.flatten(), grid_y.flatten(),
+                                 grid_z.flatten(), np.ones((grid_x.size, ))))
+        flatten_grid = flatten_grid.T.dot(rx).T
+        flatten_grid = flatten_grid.T.dot(ry).T
+        flatten_grid = flatten_grid.T.dot(rz).T
+        return flatten_grid[0, :].reshape(grid_x.shape), flatten_grid[1, :].reshape(
+            grid_y.shape), flatten_grid[2, :].reshape(grid_z.shape)
+
+
 class Patch25DB(object):
     '''
     A Simple Database system to store&query the
@@ -405,7 +473,7 @@ class Patch25DB(object):
         # Pad Image
 
         print('Extracting 2.5D blocks from %s' % img_name)
-        # Calls BlockExtractor
+        # Calls Patch25DExtractor
         candidates = self._get_candidates(img)
 
         nsample_to_extract = candidates.shape[0] if candidates.shape[
@@ -422,8 +490,8 @@ class Patch25DB(object):
         meta.create_dataset(
             'nsample', data=np.asarray(nsample_to_extract).reshape(1, ))
         data_grp = img_grp.create_group('data')
-        data_grp.create_dataset('x', (nsample_to_extract, max(nrotate, 1), len(radii),
-                                      2 * K + 1, 2 * K + 1, 3))
+        data_grp.create_dataset('x', (nsample_to_extract, max(nrotate, 1),
+                                      len(radii), 2 * K + 1, 2 * K + 1, 3))
         data_grp.create_dataset('dist', (nsample_to_extract, 1))
         data_grp.create_dataset('label', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
@@ -453,7 +521,7 @@ class Patch25DB(object):
 
             # print('Putting ', batch_start, batch_end)
 
-            e = BlockExtractor(K=K, radii=radii, nrotate=nrotate)
+            e = Patch25DExtractor(K=K, radii=radii, nrotate=nrotate)
             e.set_input(img, distmap, labelmap)
             e.set_candidates(batch_candidates)
             e.set_batch_bounds(batch_start, batch_end)
@@ -492,7 +560,8 @@ class Patch25DB(object):
             self._db[img_name]['data']['x'][batch_start:
                                             batch_end, :, :, :, :, :] = x
             self._db[img_name]['data']['dist'][batch_start:batch_end, :] = dist
-            self._db[img_name]['data']['label'][batch_start:batch_end, :] = label
+            self._db[img_name]['data']['label'][batch_start:
+                                                batch_end, :] = label
             self._db[img_name]['data']['c'][batch_start:batch_end] = c
             task_queue.task_done()
             self.disconnect()
@@ -514,7 +583,8 @@ class Patch25DB(object):
         return len([k for k in self._db.keys() if k != 'cache'])
 
     def get_cached_train(self):
-        return self._db['cache']['train_x'][()], self._db['cache']['train_y'][()]
+        return self._db['cache']['train_x'][()], self._db['cache']['train_y'][(
+        )]
 
     def cache_train(self, train_x, train_y):
         if 'cache' not in self._db:
@@ -553,16 +623,16 @@ class Patch25DB(object):
             sample_idx = np.concatenate(
                 (zero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
                           else zero_idx.size],
-                 nonzero_idx[:nsample_each_cls if zero_idx.size > nsample_each_cls
-                             else zero_idx.size]))
+                 nonzero_idx[:nsample_each_cls if zero_idx.size >
+                             nsample_each_cls else zero_idx.size]))
         else:
             nsample_nonzero = np.floor(nsample_each * 1 / 4)
             nsample_zero = np.floor(nsample_each * 3 / 4)
             sample_idx = np.concatenate(
-                (zero_idx[:nsample_zero if zero_idx.size > nsample_zero
-                          else zero_idx.size],
-                 nonzero_idx[:nsample_nonzero if zero_idx.size > nsample_nonzero
-                             else zero_idx.size]))
+                (zero_idx[:nsample_zero
+                          if zero_idx.size > nsample_zero else zero_idx.size],
+                 nonzero_idx[:nsample_nonzero if zero_idx.size >
+                             nsample_nonzero else zero_idx.size]))
 
         # np.random.shuffle(sample_idx)
         sample_idx = np.squeeze(sample_idx)
@@ -578,12 +648,13 @@ class Patch25DB(object):
 
         # for i, idx in enumerate(tqdm(sample_idx)):
         sample_idx = np.sort(sample_idx)
-        patch_idx = np.arange(len(sample_idx)) 
+        patch_idx = np.arange(len(sample_idx))
         patches[patch_idx, :, :, :, :] = x[sample_idx, :, :, :, :]
         groundtruth[patch_idx, :] = y[sample_idx, :]
         coords[patch_idx] = c[sample_idx, :]
 
-        print('Nonzeros: %d/%d' % (np.count_nonzero(groundtruth), groundtruth.size))
+        print('Nonzeros: %d/%d' %
+              (np.count_nonzero(groundtruth), groundtruth.size))
 
         return patches, groundtruth, coords
 
@@ -596,7 +667,7 @@ class Patch25DB(object):
             y = self._db[img_names[idx]]['data']['label']
         else:
             y = self._db[img_names[idx]]['data']['dist']
-        
+
         return x, y, c
 
     def get_im_shape(self, idx):
@@ -619,7 +690,8 @@ def flatten_blocks(x, y=None):
     for i in range(nsample):
         for j in range(nrotate):
             for z in range(nscale):
-                xnew[i * nrotate + j * nscale + z, :, :, :] = x[i, j, z, :, :, :]
+                xnew[i * nrotate + j * nscale + z, :, :, :] = x[i, j,
+                                                                z, :, :, :]
 
     if y is not None:
         return xnew, y
@@ -769,7 +841,9 @@ if __name__ == '__main__':
     if args.swc is None:
 
         if args.distmap is None or args.labelmap is None:
-            raise Exception('SWC file not provided, thus both distmap and labelmap should be provided in .npy files')
+            raise Exception(
+                'SWC file not provided, thus both distmap and labelmap should be provided in .npy files'
+            )
 
         distmap = Image3D(np.load(args.distmap))
         labelmap = Image3D(np.load(args.labelmap))
