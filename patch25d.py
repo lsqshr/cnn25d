@@ -8,6 +8,7 @@ import multiprocessing as mp
 from matplotlib import pyplot as plt
 from mpl_toolkits.mplot3d import axes3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 # from mayavi.mlab import contour3d
 
 
@@ -218,7 +219,7 @@ class Patch25DExtractor(object):
         # Claim the memory for all 2.5D blocks
         self._blocks = np.zeros(shape=(nsample, max(self._nrotate, 1),
                                        len(self._radii), 2 * self._K + 1,
-                                       2 * self._K + 1, 3))
+                                       2 * self._K + 1, len(self._grids)))
         self._dist = np.zeros((nsample, 1))
         self._label = np.zeros((nsample, 1))
 
@@ -227,7 +228,8 @@ class Patch25DExtractor(object):
                                np.arange(imgvox.shape[2]))
 
         # The grid used below this are all flatten for speed
-        base_flatten_grid = np.zeros((3, 4, self._grids[0][0].size))
+        base_flatten_grid = np.zeros(
+            (len(self._grids), 4, self._grids[0][0].size))
 
         for i in range(len(self._grids)):
             base_flatten_grid[i, :, :] = np.stack(
@@ -281,14 +283,10 @@ class Patch25DExtractor(object):
         return self._candidates
 
     def _sample(self, trns, imgvox):
-        xy_pts = trns[0, :3, :].T
-        yz_pts = trns[1, :3, :].T
-        xz_pts = trns[2, :3, :].T
+        pts = [trns[i, :3, :].T for i in range(len(self._grids))]
         binterp = RegularGridInterpolator(self._standard_grid, imgvox)
         return np.stack(
-            (binterp(xy_pts).reshape((self._kernelsz, self._kernelsz)),
-             binterp(yz_pts).reshape((self._kernelsz, self._kernelsz)),
-             binterp(xz_pts).reshape((self._kernelsz, self._kernelsz))),
+            [binterp(p).reshape((self._kernelsz, self._kernelsz)) for p in pts],
             axis=-1)
 
     def _init_grids(self):
@@ -374,6 +372,9 @@ class HEX25DExtractor(Patch25DExtractor):
     Each set of 2D patches are pi/3 away from each other 
     '''
 
+    def __init__(self, K=7, radii=(7), nrotate=1):
+        super(HEX25DExtractor, self).__init__(K, radii, nrotate)
+
     # Override _init_grids to make Hex 2.5D patches
     def _init_grids(self):
         width = 2 * self._K + 1
@@ -434,8 +435,9 @@ class HEX25DExtractor(Patch25DExtractor):
         flatten_grid = flatten_grid.T.dot(rx).T
         flatten_grid = flatten_grid.T.dot(ry).T
         flatten_grid = flatten_grid.T.dot(rz).T
-        return flatten_grid[0, :].reshape(grid_x.shape), flatten_grid[1, :].reshape(
-            grid_y.shape), flatten_grid[2, :].reshape(grid_z.shape)
+        return flatten_grid[0, :].reshape(grid_x.shape), flatten_grid[
+            1, :].reshape(grid_y.shape), flatten_grid[2, :].reshape(
+                grid_z.shape)
 
 
 class Patch25DB(object):
@@ -444,9 +446,10 @@ class Patch25DB(object):
     2.5 blocks of voxels using h5 files
     '''
 
-    def __init__(self, extract_batch_size=1000):
+    def __init__(self, extract_batch_size=1000, hex=False):
         self._extract_batch_size = extract_batch_size
         self._sema = mp.Semaphore(1)
+        self._hex = hex
 
     def connect(self, h5file=None, mode='a'):
         print('-- Trying to open h5 file at %s' % h5file)
@@ -490,8 +493,8 @@ class Patch25DB(object):
         meta.create_dataset(
             'nsample', data=np.asarray(nsample_to_extract).reshape(1, ))
         data_grp = img_grp.create_group('data')
-        data_grp.create_dataset('x', (nsample_to_extract, max(nrotate, 1),
-                                      len(radii), 2 * K + 1, 2 * K + 1, 3))
+        data_grp.create_dataset('x', (nsample_to_extract, max(nrotate, 1), len(radii),
+                                      2 * K + 1, 2 * K + 1, 9 if self._hex else 3))
         data_grp.create_dataset('dist', (nsample_to_extract, 1))
         data_grp.create_dataset('label', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
@@ -519,9 +522,11 @@ class Patch25DB(object):
             batch_end = batch_end if batch_end <= nsample_to_extract else nsample_to_extract
             batch_candidates = candidates[batch_start:batch_end, :]
 
-            # print('Putting ', batch_start, batch_end)
+            if self._hex:
+                e = HEX25DExtractor(K=K, radii=radii, nrotate=nrotate)
+            else:
+                e = Patch25DExtractor(K=K, radii=radii, nrotate=nrotate)
 
-            e = Patch25DExtractor(K=K, radii=radii, nrotate=nrotate)
             e.set_input(img, distmap, labelmap)
             e.set_candidates(batch_candidates)
             e.set_batch_bounds(batch_start, batch_end)
@@ -641,7 +646,7 @@ class Patch25DB(object):
 
         # Claim memory for the patches
         patches = np.zeros(
-            (nsample_each, nrotate, nscale, kernelsz, kernelsz, 3))
+            (nsample_each, nrotate, nscale, kernelsz, kernelsz, 9 if self._hex else 3))
 
         groundtruth = np.zeros((nsample_each, 1))
         coords = np.zeros((nsample_each, 3))
@@ -677,9 +682,8 @@ class Patch25DB(object):
 
 
 def flatten_blocks(x, y=None):
-    # Transform the blocks to nsample*NROTATION X K X K X 3*NSCALE
-    nsample, nrotate, nscale, kernelsz, _, _ = x.shape
-    xnew = np.zeros((nsample * nrotate * nscale, kernelsz, kernelsz, 3))
+    nsample, nrotate, nscale, kernelsz, _, ngrid = x.shape
+    xnew = np.zeros((nsample * nrotate * nscale, kernelsz, kernelsz, ngrid))
 
     if y is not None:
         # Assign value y to each observation
@@ -808,10 +812,13 @@ if __name__ == '__main__':
         default=7,
         help="The radius of the sampled patch. Default 7")
 
+    parser.add_argument('--hex', dest='hex', action='store_true')
+    parser.set_defaults(hex=False)
+
     args = parser.parse_args()
 
     # Extract 2.5D Blocks
-    db = Patch25DB(args.batch_size)
+    db = Patch25DB(args.batch_size, args.hex)
     db.connect(h5file=args.h5)
 
     template_img = None

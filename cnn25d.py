@@ -1,4 +1,5 @@
 import numpy as np
+import h5py
 from scipy.stats import gmean
 from tqdm import tqdm
 from keras.models import Sequential
@@ -10,6 +11,7 @@ from keras.layers.advanced_activations import ELU
 from matplotlib import pyplot as plt
 from keras.models import load_model
 from patch25d import *
+from sklearn.metrics import explained_variance_score, mean_absolute_error, mean_squared_error, r2_score
 
 from rivuletpy.utils.io import *
 import argparse
@@ -109,7 +111,6 @@ class Cnn25D(object):
         return self._model.predict(x)
 
     def im_predict(self, x, idx, shape):
-        # x = x.astype('float32')
         im = np.zeros(shape)
         if x.ndim == 4:
             p = self.predict(x)
@@ -129,7 +130,7 @@ class Cnn25D(object):
         for i in tqdm(range(idx.shape[0])):
             im[math.floor(idx[i, 0]), math.floor(idx[i, 1]), math.floor(idx[i, 2])] = p[i]
 
-        return im
+        return im, p
 
     def plot(self):
         from IPython.display import SVG, display
@@ -146,7 +147,7 @@ class Cnn25D(object):
         print('Loading model from h5path')
         self._model = load_model(h5path)
 
-    def plot_history(self):
+    def plot_history(self, imgpath):
         # summarize history for loss
         plt.figure()
         plt.plot(self._history.history['loss'])
@@ -155,7 +156,7 @@ class Cnn25D(object):
         plt.ylabel('loss')
         plt.xlabel('epoch')
         plt.legend(['train', 'validate'], loc='upper right')
-        plt.savefig('history.eps')
+        plt.savefig(imgpath)
 
 
 class Cnn25DH5(Cnn25D):
@@ -222,15 +223,35 @@ class Cnn25DH5(Cnn25D):
                            h5db,
                            testidx,
                            model_path=None,
-                           predicted_path=None):
+                           predicted_path=None,
+                           metrics=True):
         x, y, c = h5db.get_all_patches_from(testidx)
         shape = h5db.get_im_shape(testidx)
 
         # Load model from file if stated
         if model_path is not None:
             self.load_model_from_h5(model_path)
-        im_predicted = self.im_predict(x, c, shape)
-        return im_predicted
+        im, p = self.im_predict(x, c, shape)
+
+        # Try to write the metrics in the model cache
+        cache = h5py.File(model_path, 'r+')
+        metrics = {}
+        metrics['evs'] = explained_variance_score(y, p)
+        metrics['mae'] = mean_absolute_error(y, p)
+        metrics['mse'] = mean_squared_error(y, p)
+        metrics['r2'] = r2_score(y, p)
+
+        for key in metrics:
+            dpath = '/metrics/%d/%s' % (testidx, key)
+            if dpath in cache:
+                m = cache[dpath]
+                m[()] = metrics[key]
+            else:
+                cache[dpath] = metrics[key]
+
+        cache.close()
+
+        return im, metrics
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -257,9 +278,9 @@ if __name__ == '__main__':
         '-o',
         '--model_cache',
         type=str,
-        default='model.h5',
+        default='model',
         required=False,
-        help='The h5 file to cache the trained model.')
+        help='The prefix for the cached model, stats and history plot.')
 
     parser.add_argument(
         '-e',
@@ -280,7 +301,7 @@ if __name__ == '__main__':
         '--test_idx',
         type=int,
         nargs='+',
-        default=-1,
+        default=[-1,],
         help='''Which image is left for testing.
                 Default 0.''')
 
@@ -301,10 +322,13 @@ if __name__ == '__main__':
     parser.add_argument('--cache', dest='cache', action='store_true')
     parser.set_defaults(cache=False)
 
+    parser.add_argument('--hex', dest='hex', action='store_true')
+    parser.set_defaults(hex=False)
+
     args = parser.parse_args()
 
     cnn = Cnn25DH5(binary=args.binary)
-    h5db = Patch25DB()
+    h5db = Patch25DB(hex=args.hex)
     h5db.connect(args.inh5, mode='r+')  # It might write the h5 file to cache the train data
 
     if args.train:
@@ -313,20 +337,34 @@ if __name__ == '__main__':
             args.test_idx,
             nsample_each=args.nsample_each,
             nepoch=args.epoch,
-            model_path=args.model_cache,
+            model_path=args.model_cache+'.h5',
             optimizer='rmsprop',
             use_cache=args.cache)
-        if args.plot:
-            cnn.plot_history()
+        cnn.plot_history(args.model_cache+'.eps')
+
+        # # Save the training history to cache h5
+        cache = h5py.File(args.model_cache+'.h5')
+        if '/history/loss' in cache:
+            loss = cache['/history/loss']
+            loss[()] = cnn._history.history['loss']
+        else:
+            cache['/history/loss'] = cnn._history.history['loss']
+        if '/history/val_loss' in cache:
+            val_loss = cache['/history/val_loss']
+            val_loss[()] = cnn._history.history['val_loss']
+        else:
+            cache['/history/val_loss'] = cnn._history.history['val_loss']
+        cache.close()
 
     if args.test:
         for tidx in args.test_idx:
-            im = cnn.im_predict_from_h5(h5db, tidx,
-                                   model_path=None if args.train else args.model_cache)
+            im, metrics = cnn.im_predict_from_h5(h5db, tidx,
+                                   model_path=args.model_cache+'.h5')
+
+            print(metrics)
 
             im2save = im.copy()
             im2save[im2save < 0.25] = 0
-            # im2save[im2save > 0.5] = 0.5
             im2save /= im2save.max()
             im2save *= 200
             writetiff3d('predicted.%d.tif' % tidx if args.predicted_path is None else args.predicted_path + '.' + str(tidx) + '.tif',
