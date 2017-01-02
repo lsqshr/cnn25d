@@ -3,3 +3,8 @@
 *.tif
 *.swc
 *.eps
+*.npy
+*.pbs
+*.txt
+*_usage
+*.ipynb
