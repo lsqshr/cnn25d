@@ -476,13 +476,14 @@ class Patch25DB(object):
         # Pad Image
 
         print('Extracting 2.5D blocks from %s' % img_name)
-        # Calls Patch25DExtractor
+
         candidates = self._get_candidates(img)
 
         nsample_to_extract = candidates.shape[0] if candidates.shape[
             0] < nsample or nsample < 0 else nsample
 
         # Create a new group for this image
+        print('Creating dataset')
         img_grp = self._db.create_group(img_name)
         meta = img_grp.create_group('meta')
 
@@ -499,14 +500,15 @@ class Patch25DB(object):
         data_grp.create_dataset('label', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
         self._db.close()  # Close for safe write
+        print('Datasets created')
 
-        # Setup the tqdm bar
         task_queue = mp.JoinableQueue()
 
         procs = []
         # Start the Process Workers
         for i in range(nthread):
             # Make the process pool
+            print('Starting Process %d' % i)
             p = mp.Process(
                 name=str(i),
                 target=self._extract_worker,
