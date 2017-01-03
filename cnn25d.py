@@ -1,70 +1,16 @@
+import argparse
 import numpy as np
 import h5py
 from scipy.stats import gmean
 from tqdm import tqdm
-from keras.models import Sequential
-from keras.layers import Dense, Activation, Flatten
-from keras.layers import Convolution2D, MaxPooling2D
-from keras.layers.normalization import BatchNormalization
-from keras.layers.noise import GaussianDropout, GaussianNoise
-from keras.layers.advanced_activations import ELU
 from matplotlib import pyplot as plt
 from keras.models import load_model
+from keras.callbacks import TensorBoard
 from patch25d import *
 from sklearn.metrics import explained_variance_score, mean_absolute_error, mean_squared_error, r2_score
-
-from rivuletpy.utils.io import *
-import argparse
-
 from matplotlib import pyplot as plt
-
-
-def _make_cnn(in_shape, binary=True, optimizer='rmsprop'):
-    '''
-    Make the CNN Model
-
-    Parameters:
-    in_shape: the numpy shape of the input matrix
-    binary: True if the ground truth labels are binary
-    '''
-
-    model = Sequential()
-    model.add(BatchNormalization(input_shape=in_shape[1:]))
-    model.add(
-        Convolution2D(
-            128, 5, 5, border_mode='same'))
-    model.add(BatchNormalization())
-    model.add(ELU())
-    model.add(MaxPooling2D(pool_size=(2, 2), dim_ordering='tf'))
-    # model.add(GaussianNoise(1))
-    model.add(GaussianDropout(0.25))
-    model.add(Convolution2D(64, 3, 3, border_mode='same'))
-    model.add(BatchNormalization())
-    model.add(ELU())
-    model.add(MaxPooling2D(pool_size=(2, 2), dim_ordering='tf'))
-    # model.add(GaussianNoise(1))
-    model.add(GaussianDropout(0.25))
-    model.add(Flatten())
-    model.add(Dense(128))
-    model.add(BatchNormalization())
-    model.add(ELU())
-    model.add(GaussianDropout(0.25))
-    model.add(Dense(128))
-    model.add(BatchNormalization())
-    model.add(ELU())
-    model.add(GaussianDropout(0.25))
-
-    if not binary:
-        model.add(Dense(1))
-        model.add(Activation('linear'))
-        model.compile(loss='mse', optimizer=optimizer)
-    else:
-        model.add(Dense(2))
-        model.add(Activation('softmax'))
-        model.compile(loss='categorical_crossentropy',
-                      optimizer=optimizer,
-                      metrics=['accuracy'])
-    return model
+from rivuletpy.utils.io import *
+from nets import NetBuilder
 
 
 class Cnn25D(object):
@@ -72,8 +18,9 @@ class Cnn25D(object):
     Simple 2.5D CNN with input and ground truth loaded in memory
     '''
 
-    def __init__(self, binary=False):
+    def __init__(self, binary=False, block_type='basic'):
         self._binary = binary
+        self._block_type = block_type # Can be basic/residual
 
     def train(self, x, y, epoch, model_path='cache.h5', optimizer='rmsprop'):
         x = x.astype('float32')
@@ -92,14 +39,29 @@ class Cnn25D(object):
         x = self.normalize_feats(x)
 
         # Make the CNN model
-        self._model = _make_cnn(x.shape, self._binary, optimizer)
+        # self._model = _make_cnn(x.shape, self._binary, optimizer)
+        builder = NetBuilder(
+            'softmax' if self._binary else 'linear',
+            2 if self._binary else 1,
+            block_type=self._block_type,
+            nb_row=3,
+            nb_col=3,
+            nb_filter=64,
+            ndense=128,
+            dropout=0.25)
+        self._model = builder.build(x.shape[1:])
+        self._model.compile(
+            loss="categorical_crossentropy" if self._binary else "mse",
+            optimizer="rmsprop")
+        tb = TensorBoard(log_dir='./logs', histogram_freq=5, write_graph=True)
 
         self._history = self._model.fit(x,
                                         y,
                                         batch_size=64,
                                         nb_epoch=epoch,
                                         validation_split=0.1,
-                                        shuffle=True)
+                                        shuffle=True,
+                                        callbacks=[tb])
         self._model.save(model_path)
 
     def normalize_feats(self, x):
@@ -128,15 +90,16 @@ class Cnn25D(object):
                 p = p > 0.5
 
         for i in tqdm(range(idx.shape[0])):
-            im[math.floor(idx[i, 0]), math.floor(idx[i, 1]), math.floor(idx[i, 2])] = p[i]
+            im[math.floor(idx[i, 0]),
+               math.floor(idx[i, 1]),
+               math.floor(idx[i, 2])] = p[i]
 
         return im, p
 
-    def plot(self):
-        from IPython.display import SVG, display
-        from keras.utils.visualize_util import model_to_dot
-        display(SVG(model_to_dot(self._model).create(prog='dot', format='svg')))
-    
+    def plot(self, fname='model.png'):
+        from keras.utils.visualize_util import plot
+        plot(self._model, to_file=fname)
+
     def get_model(self):
         return self._model
 
@@ -166,8 +129,8 @@ class Cnn25DH5(Cnn25D):
     from different 3D images using patch25d
     '''
 
-    def __init__(self, binary=False):
-        super(Cnn25DH5, self).__init__(binary)
+    def __init__(self, binary=False, block_type='basic'):
+        super(Cnn25DH5, self).__init__(binary, block_type)
 
     def simple_train_h5(self,
                         h5db,
@@ -267,6 +230,14 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        '--cnntype',
+        type=str,
+        default='basic',
+        required=False,
+        help='The type of CNN to use (basic/residual). Default basic. '
+    )
+
+    parser.add_argument(
         '--predicted_path',
         type=str,
         default=None,
@@ -327,7 +298,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    cnn = Cnn25DH5(binary=args.binary)
+    cnn = Cnn25DH5(args.binary, args.cnntype)
     h5db = Patch25DB(hex=args.hex)
     h5db.connect(args.inh5, mode='r+')  # It might write the h5 file to cache the train data
 
@@ -367,7 +338,7 @@ if __name__ == '__main__':
             im2save[im2save < 0.25] = 0
             im2save /= im2save.max()
             im2save *= 200
-            writetiff3d('predicted.%d.tif' % tidx if args.predicted_path is None else args.predicted_path + '.' + str(tidx) + '.tif',
+            writetiff3d(args.model_cache + '.%d.tif' % tidx if args.predicted_path is None else args.predicted_path + '.' + str(tidx) + '.tif',
                         im2save.astype('uint8'))
 
             if args.plot:
@@ -376,6 +347,10 @@ if __name__ == '__main__':
                 ax[0].set_title('predicted')
                 ax[1].imshow(im.max(-1) > 0)
                 ax[1].set_title('region')
+
+                # Plot the model
+                plt.figure()
+                cnn.plot(args.model_cache+'.png')
 
     if args.plot:
         plt.show()
