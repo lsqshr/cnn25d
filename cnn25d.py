@@ -1,28 +1,29 @@
+import pickle
 import argparse
 import numpy as np
 import h5py
-from scipy.stats import gmean
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 from keras.models import load_model
 from keras.callbacks import TensorBoard
 from patch25d import *
+from sklearn.svm import SVR
 from sklearn.metrics import explained_variance_score, mean_absolute_error, mean_squared_error, r2_score
-from matplotlib import pyplot as plt
 from rivuletpy.utils.io import *
 from nets import NetBuilder
+import dtcwt
 
 
-class Cnn25D(object):
-    '''
-    Simple 2.5D CNN with input and ground truth loaded in memory
-    '''
-
-    def __init__(self, binary=False, block_type='basic'):
+class Learner(object):
+    def __init__(self, binary=False, model_path=None):
         self._binary = binary
-        self._block_type = block_type # Can be basic/residual
+        self._model_path = model_path
 
-    def train(self, x, y, epoch, model_path='cache.h5', optimizer='rmsprop'):
+    def _normalize_feats(self, x):
+        x = x - x.mean() / (x.max() - x.min())
+        return x
+
+    def _init_data(self, x, y):
         x = x.astype('float32')
         y = y.astype('float32')
 
@@ -36,41 +37,13 @@ class Cnn25D(object):
         else:
             y = y / y.max()
 
-        x = self.normalize_feats(x)
+        x = self._normalize_feats(x)
 
-        # Make the CNN model
-        # self._model = _make_cnn(x.shape, self._binary, optimizer)
-        builder = NetBuilder(
-            'softmax' if self._binary else 'linear',
-            2 if self._binary else 1,
-            block_type=self._block_type,
-            nb_row=3,
-            nb_col=3,
-            nb_filter=64,
-            ndense=128,
-            dropout=0.25)
-        self._model = builder.build(x.shape[1:])
-        self._model.compile(
-            loss="categorical_crossentropy" if self._binary else "mse",
-            optimizer="rmsprop")
-        tb = TensorBoard(log_dir='./logs', histogram_freq=5, write_graph=True)
-
-        self._history = self._model.fit(x,
-                                        y,
-                                        batch_size=64,
-                                        nb_epoch=epoch,
-                                        validation_split=0.1,
-                                        shuffle=True,
-                                        callbacks=[tb])
-        self._model.save(model_path)
-
-    def normalize_feats(self, x):
-        # x = x - x.mean() / x.std()
-        x = x - x.mean() / (x.max() - x.min())
-        return x
+        return x, y
 
     def predict(self, x):
-        return self._model.predict(x)
+        # To be implemented in subclasses
+        pass
 
     def im_predict(self, x, idx, shape):
         im = np.zeros(shape)
@@ -79,7 +52,7 @@ class Cnn25D(object):
         elif x.ndim == 6:
             nsample, nrotate, nscale, kernelsz, _, _ = x.shape
             x = flatten_blocks(x, None)
-            # x = self.normalize_feats(x)
+            # x = self._normalize_feats(x)
             p = self.predict(x)
             p = p.reshape((nsample, nrotate * nscale))
             if p.shape[1] >= 2:
@@ -96,19 +69,65 @@ class Cnn25D(object):
 
         return im, p
 
+
+class Cnn25D(Learner):
+    '''
+    Simple 2.5D CNN with input and ground truth loaded in memory
+    '''
+
+    def __init__(self,
+                 binary=False,
+                 block_type='basic',
+                 epoch=10,
+                 model_path=None,
+                 optimizer='rmsprop'):
+        super(Cnn25D, self).__init__(binary, model_path)
+        self._block_type = block_type  # Can be basic/residual
+        self._epoch = epoch
+        self._optimizer = optimizer
+
+    def train(self, x, y):
+        x, y = self._init_data(x, y)
+
+        # Make the CNN model
+        # self._model = _make_cnn(x.shape, self._binary, optimizer)
+        builder = NetBuilder(
+            'softmax' if self._binary else 'linear',
+            2 if self._binary else 1,
+            block_type=self._block_type,
+            nb_row=3,
+            nb_col=3,
+            nb_filter=64,
+            ndense=128,
+            dropout=0.25)
+        self._model = builder.build(x.shape[1:])
+        self._model.compile(
+            loss="categorical_crossentropy" if self._binary else "mse",
+            optimizer=self._optimizer)
+        tb = TensorBoard(log_dir='./logs', histogram_freq=5, write_graph=True)
+
+        self._history = self._model.fit(x,
+                                        y,
+                                        batch_size=64,
+                                        nb_epoch=self._epoch,
+                                        validation_split=0.1,
+                                        shuffle=True,
+                                        callbacks=[tb])
+        self._save_model()
+
+    def save_model(self):
+        self._model.save(self._model_path)
+
+    def predict(self, x):
+        return self._model.predict(x)
+
     def plot(self, fname='model.png'):
         from keras.utils.visualize_util import plot
         plot(self._model, to_file=fname)
 
-    def get_model(self):
-        return self._model
-
-    def set_model(self, model):
-        self._model = model
-
-    def load_model_from_h5(self, h5path):
+    def load_model(self, modelpath):
         print('Loading model from h5path')
-        self._model = load_model(h5path)
+        self._model = load_model(modelpath)
 
     def plot_history(self, imgpath):
         # summarize history for loss
@@ -122,26 +141,78 @@ class Cnn25D(object):
         plt.savefig(imgpath)
 
 
-class Cnn25DH5(Cnn25D):
+class WaveletSVM3D(Learner):
     '''
-    2.5D CNN that takes a h5 file as input
+    A learner for 3D blocks with 3D Wavelet features and SVR/SVM learner
+    '''
+    def __init__(self, binary, model_path='model.pkl', nlevels=2):
+        super(WaveletSVM3D, self).__init__(binary, model_path)
+        self._nlevels = nlevels
+
+    def train(self, x, y):
+        # This class only take care of 3D blocks
+        assert (x.shape[-1] == x.shape[-2] and
+                x.shape[-1] == x.shape[-3])
+        x, y = self._init_data(x, y)
+
+        print('Extracting 3D wavelet features...')
+        x = self.wavelet3d_feats(x)
+        self._model = SVR(C=1.0, epsilon=0.2, verbose=True)
+        print('Fitting SVR...')
+        self._model.fit(x, y)
+        print('End Fitting SVR...')
+
+    def predict(self, x):
+        x = self.wavelet3d_feats(x)
+        return self._model.predict(x)
+
+    def wavelet3d_feats(self, x):
+        wt = dtcwt.Transform3d()
+
+        if x.shape[1] % 2 != 0:  # Cut one border for wavelet
+            x = x[:, :-1, :-1, :-1]
+
+        flat = []
+        for i in tqdm(range(x.shape[0])):
+            b = x[i, :, :, :]
+            trans = wt.forward(b, nlevels=self._nlevels)
+            for t in trans.highpasses:
+                for l in range(t.shape[-1]):
+                    C = t[:, :, :, l]
+                    bad = C <= 0.2 * C.max()
+                    C[bad] = 0
+                    t[:, :, :, l] = C
+            wvec = np.concatenate([t.flatten() for t in trans.highpasses])
+            flat.append(wvec)
+
+        x = np.stack(flat)
+        return x
+
+    def save_model(self):
+        pickle.dump(self._model, self._model_path)
+
+    def load_model(self, model_path):
+        self._model = pickle.load(modelpath)
+
+
+class LearnH5(object):
+    '''
+    Learner that takes a h5 file as input
     The h5 files contains the 2.5D patches sampled
     from different 3D images using patch25d
     '''
 
-    def __init__(self, binary=False, block_type='basic'):
-        super(Cnn25DH5, self).__init__(binary, block_type)
+    def __init__(self, learner):
+        self._learner = learner
 
     def simple_train_h5(self,
                         h5db,
                         testidx,
                         nsample_each=5000,
-                        nepoch=10,
-                        model_path='model.h5',
-                        optimizer='rmsprop',
                         use_cache=False):
         '''
         Train 2.5D CNN from the 2.5D patches in a h5 file
+        by loading all data into memory in front
         '''
 
         assert(isinstance(testidx, list))
@@ -159,9 +230,9 @@ class Cnn25DH5(Cnn25D):
 
             train_x = []
             train_y = []
-            for i,idx in enumerate(trainidx):
+            for i, idx in enumerate(trainidx):
                 print('== Collect patches from image %d/%d' % (i, len(trainidx)))
-                x, y, _ = h5db.select_patches_from(idx, nsample_each, self._binary)
+                x, y, _ = h5db.select_patches_from(idx, nsample_each, self._learner._binary)
                 train_x.append(x)
                 train_y.append(y)
 
@@ -179,8 +250,7 @@ class Cnn25DH5(Cnn25D):
             train_y = np.squeeze(train_y[random_idx, :])
             h5db.cache_train(train_x, train_y)
 
-        train_x = self.normalize_feats(train_x)
-        self.train(train_x, train_y, nepoch, model_path, optimizer)
+        self._learner.train(train_x, train_y)
 
     def im_predict_from_h5(self,
                            h5db,
@@ -193,8 +263,8 @@ class Cnn25DH5(Cnn25D):
 
         # Load model from file if stated
         if model_path is not None:
-            self.load_model_from_h5(model_path)
-        im, p = self.im_predict(x, c, shape)
+            self._learner.load_model(model_path)
+        im, p = self._learner.im_predict(x, c, shape)
 
         # Try to write the metrics in the model cache
         cache = h5py.File(model_path, 'r+')
@@ -230,11 +300,11 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
-        '--cnntype',
+        '--model_type',
         type=str,
-        default='basic',
+        default='seqcnn',
         required=False,
-        help='The type of CNN to use (basic/residual). Default basic. '
+        help='The type of CNN to use (seqcnn/residual/wavelet_svm). Default seqcnn. '
     )
 
     parser.add_argument(
@@ -276,6 +346,13 @@ if __name__ == '__main__':
         help='''Which image is left for testing.
                 Default 0.''')
 
+    parser.add_argument(
+        '--patch_type',
+        type=str,
+        default='25d',
+        required=False,
+        help='The type of extracted patch. Options are \'25d\', \'nov\' and \'3d\'. Default \'25d\'')
+
     # Arguments for soma detection
     parser.add_argument('--train', dest='train', action='store_true')
     parser.set_defaults(train=False)
@@ -287,50 +364,61 @@ if __name__ == '__main__':
     parser.add_argument('--test', dest='test', action='store_true')
     parser.set_defaults(test=False)
 
-    parser.add_argument('--no-binary', dest='binary', action='store_false')
-    parser.set_defaults(binary=True)
+    parser.add_argument('--binary', dest='binary', action='store_true')
+    parser.set_defaults(binary=False)
 
     parser.add_argument('--cache', dest='cache', action='store_true')
     parser.set_defaults(cache=False)
 
-    parser.add_argument('--hex', dest='hex', action='store_true')
-    parser.set_defaults(hex=False)
-
     args = parser.parse_args()
 
-    cnn = Cnn25DH5(args.binary, args.cnntype)
-    h5db = Patch25DB(hex=args.hex)
-    h5db.connect(args.inh5, mode='r+')  # It might write the h5 file to cache the train data
+    if args.model_type in ('seqcnn', 'residual'):
+        model = Cnn25D(
+            args.binary,
+            args.model_type,
+            epoch=args.epoch,
+            model_path=args.model_cache + '.h5',
+            optimizer='rmsprop')
+    elif args.model_type == 'wavelet_svm':
+        model = WaveletSVM3D(
+            args.binary,
+            model_path=args.model_cache + '.pkl')
+
+    lh5 = LearnH5(model)
+    h5db = Patch25DB(patch_type=args.patch_type)
+    # NOTE: It might write the h5 file to cache the train data
+    h5db.connect(args.inh5, mode='r+')  
 
     if args.train:
-        cnn.simple_train_h5(
+        lh5.simple_train_h5(
             h5db,
             args.test_idx,
             nsample_each=args.nsample_each,
-            nepoch=args.epoch,
-            model_path=args.model_cache+'.h5',
-            optimizer='rmsprop',
             use_cache=args.cache)
-        cnn.plot_history(args.model_cache+'.eps')
 
-        # # Save the training history to cache h5
-        cache = h5py.File(args.model_cache+'.h5')
-        if '/history/loss' in cache:
-            loss = cache['/history/loss']
-            loss[()] = cnn._history.history['loss']
-        else:
-            cache['/history/loss'] = cnn._history.history['loss']
-        if '/history/val_loss' in cache:
-            val_loss = cache['/history/val_loss']
-            val_loss[()] = cnn._history.history['val_loss']
-        else:
-            cache['/history/val_loss'] = cnn._history.history['val_loss']
-        cache.close()
+        # Save the training history to cache h5 for cnn models
+        if args.model_type in ('seqcnn', 'residual'):
+            lh5._learner.plot(args.model_cache+'.png')
+            lh5._learner.plot_history(args.model_cache+'.eps')
+
+            cache = h5py.File(args.model_cache+'.h5')
+            if '/history/loss' in cache:
+                loss = cache['/history/loss']
+                loss[()] = lh5._learner._history.history['loss']
+            else:
+                cache['/history/loss'] = lh5._learner._history.history['loss']
+            if '/history/val_loss' in cache:
+                val_loss = cache['/history/val_loss']
+                val_loss[()] = lh5._learner._history.history['val_loss']
+            else:
+                cache['/history/val_loss'] = lh5._learner._history.history['val_loss']
+            cache.close()
 
     if args.test:
         for tidx in args.test_idx:
-            im, metrics = cnn.im_predict_from_h5(h5db, tidx,
-                                   model_path=args.model_cache+'.h5')
+            im, metrics = lh5.im_predict_from_h5(
+                h5db, tidx,
+                model_path=args.model_cache+'.h5')
 
             print(metrics)
 
@@ -338,7 +426,8 @@ if __name__ == '__main__':
             im2save[im2save < 0.25] = 0
             im2save /= im2save.max()
             im2save *= 200
-            writetiff3d(args.model_cache + '.%d.tif' % tidx if args.predicted_path is None else args.predicted_path + '.' + str(tidx) + '.tif',
+            writetiff3d(args.model_cache + '.%d.tif' % tidx if args.predicted_path is None
+                        else args.predicted_path + '.' + str(tidx) + '.tif',
                         im2save.astype('uint8'))
 
             if args.plot:
@@ -347,10 +436,6 @@ if __name__ == '__main__':
                 ax[0].set_title('predicted')
                 ax[1].imshow(im.max(-1) > 0)
                 ax[1].set_title('region')
-
-                # Plot the model
-                plt.figure()
-                cnn.plot(args.model_cache+'.png')
 
     if args.plot:
         plt.show()

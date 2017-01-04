@@ -6,10 +6,6 @@ import skfmm
 import h5py
 import multiprocessing as mp
 from matplotlib import pyplot as plt
-from mpl_toolkits.mplot3d import axes3d
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-# from mayavi.mlab import contour3d
 
 
 class Image3D(object):
@@ -206,6 +202,11 @@ class Patch25DExtractor(object):
     def get_batch_bounds(self):
         return self._batch_start, self._batch_end
 
+    def _init_blocks(self, nsample):
+        self._blocks = np.zeros(shape=(nsample, max(self._nrotate, 1),
+                                       len(self._radii), 2 * self._K + 1,
+                                       2 * self._K + 1, len(self._grids)))
+
     def run(self):
         '''
         Extract 2.5D blocks from a 3D Image with the ground truth
@@ -217,11 +218,8 @@ class Patch25DExtractor(object):
         imgvox = self._bimg3d.get_data()
 
         # Claim the memory for all 2.5D blocks
-        self._blocks = np.zeros(shape=(nsample, max(self._nrotate, 1),
-                                       len(self._radii), 2 * self._K + 1,
-                                       2 * self._K + 1, len(self._grids)))
-        self._dist = np.zeros((nsample, 1))
-        self._label = np.zeros((nsample, 1))
+        self._init_blocks(nsample)
+        self._dist, self._label = np.zeros((nsample, 1)), np.zeros((nsample, 1))
 
         self._standard_grid = (np.arange(imgvox.shape[0]),
                                np.arange(imgvox.shape[1]),
@@ -271,7 +269,7 @@ class Patch25DExtractor(object):
                     trans_trns_grid = self._apply_transform(trans_trns_grid,
                                                             rt)
 
-                    # Sample the 2.5D block with the current grids
+                    # Sample the block with the current grids
                     self._blocks[i, r, s, :, :, :] = self._sample(
                         trans_trns_grid, imgvox)
         print('End of extraction')
@@ -364,16 +362,16 @@ class Patch25DExtractor(object):
         return rt
 
 
-class HEX25DExtractor(Patch25DExtractor):
+class NOV25DExtractor(Patch25DExtractor):
     '''
     Hex 2.5D Patch Extractor
 
     Each of TF observation consists of 9X2D patches (3 Sets).
-    Each set of 2D patches are pi/3 away from each other 
+    Each set of 2D patches are pi/2 away from each other 
     '''
 
     def __init__(self, K=7, radii=(7), nrotate=1):
-        super(HEX25DExtractor, self).__init__(K, radii, nrotate)
+        super(NOV25DExtractor, self).__init__(K, radii, nrotate)
 
     # Override _init_grids to make Hex 2.5D patches
     def _init_grids(self):
@@ -440,16 +438,52 @@ class HEX25DExtractor(Patch25DExtractor):
                 grid_z.shape)
 
 
+class Patch3DExtractor(Patch25DExtractor):
+    '''
+    3D Patch Extractor
+
+    Each of observation consists of 1 3D block.
+    Each 3D patch
+    '''
+    def __init__(self, K=7, radii=(7), nrotate=1):
+        super(Patch3DExtractor, self).__init__(K, radii, nrotate)
+
+    # Override _init_grids to make Hex 2.5D patches
+    def _init_grids(self):
+        width = 2 * self._K + 1
+
+        x = np.linspace(-self._K, self._K + 1, width)
+        y = np.linspace(-self._K, self._K + 1, width)
+        z = np.linspace(-self._K, self._K + 1, width)
+        gridx, gridy, gridz = np.meshgrid(x, y, z)
+
+        self._grids_backup = [[gridx, gridy, gridz], ]
+        self._grids = self._grids_backup.copy()
+
+    def _init_blocks(self, nsample):
+        self._blocks = np.zeros(shape=(nsample, max(self._nrotate, 1),
+                                       len(self._radii), 2 * self._K + 1,
+                                       2 * self._K + 1, 2 * self._K + 1))
+
+    def _sample(self, trns, imgvox):
+        pts = trns[0, :3, :].T
+        binterp = RegularGridInterpolator(self._standard_grid, imgvox)
+        return binterp(pts).reshape(
+            (self._kernelsz, self._kernelsz, self._kernelsz))
+
+
 class Patch25DB(object):
     '''
     A Simple Database system to store&query the
     2.5 blocks of voxels using h5 files
     '''
 
-    def __init__(self, extract_batch_size=1000, hex=False):
+    def __init__(self, extract_batch_size=1000, patch_type='25d'):
         self._extract_batch_size = extract_batch_size
         self._sema = mp.Semaphore(1)
-        self._hex = hex
+        assert(patch_type in ('25d', 'nov', '3d'))
+        self._patch_type = patch_type  # patch_type can be '25d'/'nov'/'3d'
+
 
     def connect(self, h5file=None, mode='a'):
         print('-- Trying to open h5 file at %s' % h5file)
@@ -474,7 +508,6 @@ class Patch25DB(object):
                    sema=None):
 
         # Pad Image
-
         print('Extracting 2.5D blocks from %s' % img_name)
 
         candidates = self._get_candidates(img)
@@ -483,6 +516,7 @@ class Patch25DB(object):
             0] < nsample or nsample < 0 else nsample
 
         # Create a new group for this image
+
         print('Creating dataset')
         img_grp = self._db.create_group(img_name)
         meta = img_grp.create_group('meta')
@@ -494,8 +528,17 @@ class Patch25DB(object):
         meta.create_dataset(
             'nsample', data=np.asarray(nsample_to_extract).reshape(1, ))
         data_grp = img_grp.create_group('data')
+
+        # Determine the depth of the block
+        if self._patch_type == '25d':
+            block_depth = 3
+        elif self._patch_type == 'nov':
+            block_depth = 9
+        elif self._patch_type == '3d':
+            block_depth = 2 * K + 1
+
         data_grp.create_dataset('x', (nsample_to_extract, max(nrotate, 1), len(radii),
-                                      2 * K + 1, 2 * K + 1, 9 if self._hex else 3))
+                                      2 * K + 1, 2 * K + 1, block_depth))
         data_grp.create_dataset('dist', (nsample_to_extract, 1))
         data_grp.create_dataset('label', (nsample_to_extract, 1))
         data_grp.create_dataset('c', (nsample_to_extract, 3))
@@ -524,10 +567,12 @@ class Patch25DB(object):
             batch_end = batch_end if batch_end <= nsample_to_extract else nsample_to_extract
             batch_candidates = candidates[batch_start:batch_end, :]
 
-            if self._hex:
-                e = HEX25DExtractor(K=K, radii=radii, nrotate=nrotate)
-            else:
+            if self._patch_type == '25d':
                 e = Patch25DExtractor(K=K, radii=radii, nrotate=nrotate)
+            elif self._patch_type == 'nov':
+                e = NOV25DExtractor(K=K, radii=radii, nrotate=nrotate)
+            elif self._patch_type == '3d':
+                e = Patch3DExtractor(K=K, radii=radii, nrotate=nrotate)
 
             e.set_input(img, distmap, labelmap)
             e.set_candidates(batch_candidates)
@@ -646,10 +691,17 @@ class Patch25DB(object):
         nsample_each = sample_idx.size
         print('sample_idx', sample_idx.shape)
 
+        # Determine the depth of the block
+        if self._patch_type == '25d':
+            block_depth = 3
+        elif self._patch_type == 'nov':
+            block_depth = 9
+        elif self._patch_type == '3d':
+            block_depth = kernelsz
+
         # Claim memory for the patches
         patches = np.zeros(
-            (nsample_each, nrotate, nscale, kernelsz, kernelsz, 9 if self._hex else 3))
-
+            (nsample_each, nrotate, nscale, kernelsz, kernelsz, block_depth))
         groundtruth = np.zeros((nsample_each, 1))
         coords = np.zeros((nsample_each, 3))
 
@@ -684,13 +736,12 @@ class Patch25DB(object):
 
 
 def flatten_blocks(x, y=None):
-    nsample, nrotate, nscale, kernelsz, _, ngrid = x.shape
-    xnew = np.zeros((nsample * nrotate * nscale, kernelsz, kernelsz, ngrid))
+    nsample, nrotate, nscale, kernelsz, _, depth = x.shape
+    xnew = np.zeros((nsample * nrotate * nscale, kernelsz, kernelsz, depth))
 
     if y is not None:
         # Assign value y to each observation
         y = np.tile(y.reshape((y.size, 1)), (1, nrotate * nscale))
-        print('y shape after tile: ', y.shape)
         y = y.reshape((nsample * nrotate * nscale, 1))
 
     for i in range(nsample):
@@ -712,7 +763,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Arguments to perform the Rivulet2 tracing algorithm.')
+        description='Arguments to extract 2.5D/NOV2.5D/3D patches from 3D images.')
 
     parser.add_argument(
         '-f',
@@ -735,6 +786,13 @@ if __name__ == '__main__':
         default=None,
         required=False,
         help='The label map file in .npy. ')
+
+    parser.add_argument(
+        '--patch_type',
+        type=str,
+        default='25d',
+        required=False,
+        help='The type of extracted patch. Options are \'25d\', \'nov\' and \'3d\'. Default \'25d\'')
 
     parser.add_argument(
         '-o',
@@ -814,13 +872,10 @@ if __name__ == '__main__':
         default=7,
         help="The radius of the sampled patch. Default 7")
 
-    parser.add_argument('--hex', dest='hex', action='store_true')
-    parser.set_defaults(hex=False)
-
     args = parser.parse_args()
 
     # Extract 2.5D Blocks
-    db = Patch25DB(args.batch_size, args.hex)
+    db = Patch25DB(args.batch_size, args.patch_type)
     db.connect(h5file=args.h5)
 
     template_img = None
