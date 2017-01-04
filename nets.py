@@ -103,7 +103,7 @@ class NetBuilder(object):
                     repetitions=r,
                     is_first_layer=i == 0)(x)
                 nb_filter *= 2
-        elif self._block_type == 'basic':
+        elif self._block_type == 'seqcnn':
             for i, r in enumerate(repetitions):
                 x = self._bn_relu_conv(nb_filter)(x)
                 x = MaxPooling2D(pool_size=(2, 2),
