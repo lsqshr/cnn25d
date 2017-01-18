@@ -13,8 +13,6 @@ from keras.layers.advanced_activations import ELU
 from keras import backend as K
 
 
-
-
 # Legacy: will be replaced by NetBuilder
 def _make_cnn(in_shape, binary=True, optimizer='rmsprop'):
     '''
@@ -72,7 +70,7 @@ class NetBuilder(object):
                  nb_col=3,
                  nb_filter=64,
                  ndense=128,
-                 dropout=0.25):
+                 dropout=0.5):
         self._output_activation = output_activation
         self._nout = num_outputs
         self._block_type = block_type
@@ -92,7 +90,7 @@ class NetBuilder(object):
             nb_filter=self._nb_filter, subsample=(2, 2))(x)
         x = MaxPooling2D(
             pool_size=(3, 3), strides=(2, 2), border_mode="same")(x)
-        x = GaussianDropout(0.25)(x)
+        x = GaussianDropout(self._dropout)(x)
 
         nb_filter = self._nb_filter
         if self._block_type == 'residual':
@@ -108,7 +106,7 @@ class NetBuilder(object):
                 x = self._bn_relu_conv(nb_filter)(x)
                 x = MaxPooling2D(pool_size=(2, 2),
                                      dim_ordering=K.image_dim_ordering())(x)
-                x = GaussianDropout(0.25)(x)
+                x = GaussianDropout(self._dropout)(x)
         else:
             raise Exception('The CNN Type %s is not defined. Valid types are basic/residual' % self._block_type)
 

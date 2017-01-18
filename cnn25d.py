@@ -2,7 +2,10 @@ import pickle
 import argparse
 import numpy as np
 import h5py
+import time
 from tqdm import tqdm
+import matplotlib as mpl
+mpl.use('Agg')  # To go across the X server on HPC
 from matplotlib import pyplot as plt
 from keras.models import load_model
 from keras.callbacks import TensorBoard
@@ -63,9 +66,8 @@ class Learner(object):
                 p = p > 0.5
 
         for i in tqdm(range(idx.shape[0])):
-            im[math.floor(idx[i, 0]),
-               math.floor(idx[i, 1]),
-               math.floor(idx[i, 2])] = p[i]
+            im[math.floor(idx[i, 0]), math.floor(idx[i, 1]), math.floor(idx[
+                i, 2])] = p[i]
 
         return im, p
 
@@ -80,11 +82,13 @@ class Cnn25D(Learner):
                  block_type='basic',
                  epoch=10,
                  model_path=None,
-                 optimizer='rmsprop'):
+                 optimizer='rmsprop',
+                 block_repeat=1):
         super(Cnn25D, self).__init__(binary, model_path)
         self._block_type = block_type  # Can be basic/residual
         self._epoch = epoch
         self._optimizer = optimizer
+        self._block_repeat = block_repeat
 
     def train(self, x, y):
         x, y = self._init_data(x, y)
@@ -100,7 +104,8 @@ class Cnn25D(Learner):
             nb_filter=64,
             ndense=128,
             dropout=0.25)
-        self._model = builder.build(x.shape[1:])
+        self._model = builder.build(
+            x.shape[1:], repetitions=[self._block_repeat, ])
         self._model.compile(
             loss="categorical_crossentropy" if self._binary else "mse",
             optimizer=self._optimizer)
@@ -113,7 +118,7 @@ class Cnn25D(Learner):
                                         validation_split=0.1,
                                         shuffle=True,
                                         callbacks=[tb])
-        self._save_model()
+        self.save_model()
 
     def save_model(self):
         self._model.save(self._model_path)
@@ -145,14 +150,14 @@ class WaveletSVM3D(Learner):
     '''
     A learner for 3D blocks with 3D Wavelet features and SVR/SVM learner
     '''
+
     def __init__(self, binary, model_path='model.pkl', nlevels=2):
         super(WaveletSVM3D, self).__init__(binary, model_path)
         self._nlevels = nlevels
 
     def train(self, x, y):
         # This class only take care of 3D blocks
-        assert (x.shape[-1] == x.shape[-2] and
-                x.shape[-1] == x.shape[-3])
+        assert (x.shape[-1] == x.shape[-2] and x.shape[-1] == x.shape[-3])
         x, y = self._init_data(x, y)
 
         print('Extracting 3D wavelet features...')
@@ -209,16 +214,17 @@ class LearnH5(object):
                         h5db,
                         testidx,
                         nsample_each=5000,
-                        use_cache=False):
+                        use_cache=False,
+                        cache_only=True):
         '''
         Train 2.5D CNN from the 2.5D patches in a h5 file
         by loading all data into memory in front
         '''
 
-        assert(isinstance(testidx, list))
+        assert (isinstance(testidx, list))
 
         if use_cache:
-            train_x, train_y = h5db.get_cached_train()
+            train_x, train_y = self._load_cache()
         else:
             nimg = h5db.get_im_num()
             trainidx = [i for i in range(nimg)]
@@ -230,9 +236,12 @@ class LearnH5(object):
 
             train_x = []
             train_y = []
+
             for i, idx in enumerate(trainidx):
-                print('== Collect patches from image %d/%d' % (i, len(trainidx)))
-                x, y, _ = h5db.select_patches_from(idx, nsample_each, self._learner._binary)
+                print('== Collect patches from image %d/%d' %
+                      (i, len(trainidx)))
+                x, y, _ = h5db.select_patches_from(idx, nsample_each,
+                                                   self._learner._binary)
                 train_x.append(x)
                 train_y.append(y)
 
@@ -241,16 +250,41 @@ class LearnH5(object):
             train_x = np.concatenate(train_x, axis=0)
             train_y = np.concatenate(train_y, axis=0)
 
-            print('nsample_each:%d\ttrain_x:%d' % (nsample_each, train_x.shape[0]))
+            print('nsample_each:%d\ttrain_x:%d' %
+                  (nsample_each, train_x.shape[0]))
 
             # Shuffle the indices
             random_idx = np.arange(train_y.shape[0])
             np.random.shuffle(random_idx)
             train_x = train_x[random_idx, :, :, :, :, :]
             train_y = np.squeeze(train_y[random_idx, :])
-            h5db.cache_train(train_x, train_y)
 
-        self._learner.train(train_x, train_y)
+            # Cache the train x and y
+            self._cache_train(train_x, train_y)
+
+        # Sometimes we only cache the data without training with no gpu instances
+        if not cache_only:
+            self._learner.train(train_x, train_y)
+
+    def _load_cache(self):
+        cachedb = h5py.File(self._learner._model_path + '.cache.h5', 'r')
+        tx = cachedb['cache/train_x'][:]
+        ty = cachedb['cache/train_y'][:]
+        return tx, ty
+
+    def _cache_train(self, x, y):
+        cachedb = h5py.File(self._learner._model_path + '.cache.h5', 'w')
+        if 'cache' not in cachedb:
+            cachedb.create_group('cache')
+        if 'cache/train_x' not in cachedb:
+            cachedb['cache/train_x'] = x
+            cachedb['cache/train_y'] = y
+        else:
+            tx = cachedb['cache/train_x']
+            ty = cachedb['cache/train_y']
+            tx[()] = x
+            ty[()] = y
+        cachedb.close()
 
     def im_predict_from_h5(self,
                            h5db,
@@ -264,7 +298,12 @@ class LearnH5(object):
         # Load model from file if stated
         if model_path is not None:
             self._learner.load_model(model_path)
+
+        t = time.time()
         im, p = self._learner.im_predict(x, c, shape)
+        t = time.time() - t
+        print('NN Predict used ', t, 's')
+        print('Average ', t * 1000 / x.shape[0], 'ms')
 
         # Try to write the metrics in the model cache
         cache = h5py.File(model_path, 'r+')
@@ -286,6 +325,7 @@ class LearnH5(object):
 
         return im, metrics
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Arguments to train 2.5D CNN.')
@@ -296,8 +336,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         required=True,
-        help='The input file. A image file (*.tif, *.nii, *.mat). '
-    )
+        help='The input file. A image file (*.tif, *.nii, *.mat). ')
 
     parser.add_argument(
         '--model_type',
@@ -312,8 +351,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         required=False,
-        help='The path to write predicted tiff. '
-    )
+        help='The path to write predicted tiff. ')
 
     parser.add_argument(
         '-o',
@@ -339,10 +377,16 @@ if __name__ == '__main__':
                 Default 5000.''')
 
     parser.add_argument(
+        '--repeat',
+        type=int,
+        default=2,
+        help='''Number of blocks to repeat (CNN block / Residual block).''')
+
+    parser.add_argument(
         '--test_idx',
         type=int,
         nargs='+',
-        default=[-1,],
+        default=[-1, ],
         help='''Which image is left for testing.
                 Default 0.''')
 
@@ -351,7 +395,8 @@ if __name__ == '__main__':
         type=str,
         default='25d',
         required=False,
-        help='The type of extracted patch. Options are \'25d\', \'nov\' and \'3d\'. Default \'25d\'')
+        help='The type of extracted patch. Options are \'25d\', \'nov\' and \'3d\'. Default \'25d\''
+    )
 
     # Arguments for soma detection
     parser.add_argument('--train', dest='train', action='store_true')
@@ -367,8 +412,11 @@ if __name__ == '__main__':
     parser.add_argument('--binary', dest='binary', action='store_true')
     parser.set_defaults(binary=False)
 
-    parser.add_argument('--cache', dest='cache', action='store_true')
-    parser.set_defaults(cache=False)
+    parser.add_argument('--use_cache', dest='use_cache', action='store_true')
+    parser.set_defaults(use_cache=False)
+
+    parser.add_argument('--cache_only', dest='cache_only', action='store_true', help='Only cache the train data. No training and testing')
+    parser.set_defaults(cache_only=False)
 
     args = parser.parse_args()
 
@@ -378,30 +426,33 @@ if __name__ == '__main__':
             args.model_type,
             epoch=args.epoch,
             model_path=args.model_cache + '.h5',
-            optimizer='rmsprop')
+            optimizer='rmsprop',
+            block_repeat=args.repeat)
     elif args.model_type == 'wavelet_svm':
-        model = WaveletSVM3D(
-            args.binary,
-            model_path=args.model_cache + '.pkl')
+        model = WaveletSVM3D(args.binary, model_path=args.model_cache + '.pkl')
 
     lh5 = LearnH5(model)
     h5db = Patch25DB(patch_type=args.patch_type)
     # NOTE: It might write the h5 file to cache the train data
-    h5db.connect(args.inh5, mode='r+')  
+    h5db.connect(args.inh5, mode='r+')
 
     if args.train:
         lh5.simple_train_h5(
             h5db,
             args.test_idx,
             nsample_each=args.nsample_each,
-            use_cache=args.cache)
+            use_cache=args.use_cache,
+            cache_only=args.cache_only)
+        if args.cache_only:
+            import sys
+            sys.exit(0)
 
         # Save the training history to cache h5 for cnn models
         if args.model_type in ('seqcnn', 'residual'):
-            lh5._learner.plot(args.model_cache+'.png')
-            lh5._learner.plot_history(args.model_cache+'.eps')
+            # lh5._learner.plot(args.model_cache+'.png')
+            lh5._learner.plot_history(args.model_cache + '.eps')
 
-            cache = h5py.File(args.model_cache+'.h5')
+            cache = h5py.File(args.model_cache + '.h5')
             if '/history/loss' in cache:
                 loss = cache['/history/loss']
                 loss[()] = lh5._learner._history.history['loss']
@@ -411,14 +462,14 @@ if __name__ == '__main__':
                 val_loss = cache['/history/val_loss']
                 val_loss[()] = lh5._learner._history.history['val_loss']
             else:
-                cache['/history/val_loss'] = lh5._learner._history.history['val_loss']
+                cache['/history/val_loss'] = lh5._learner._history.history[
+                    'val_loss']
             cache.close()
 
-    if args.test:
+    if args.test and not args.cache_only:
         for tidx in args.test_idx:
             im, metrics = lh5.im_predict_from_h5(
-                h5db, tidx,
-                model_path=args.model_cache+'.h5')
+                h5db, tidx, model_path=args.model_cache + '.h5')
 
             print(metrics)
 
@@ -426,8 +477,9 @@ if __name__ == '__main__':
             im2save[im2save < 0.25] = 0
             im2save /= im2save.max()
             im2save *= 200
-            writetiff3d(args.model_cache + '.%d.tif' % tidx if args.predicted_path is None
-                        else args.predicted_path + '.' + str(tidx) + '.tif',
+            writetiff3d(args.model_cache + '.%d.tif' % tidx
+                        if args.predicted_path is None else
+                        args.predicted_path + '.' + str(tidx) + '.tif',
                         im2save.astype('uint8'))
 
             if args.plot:
