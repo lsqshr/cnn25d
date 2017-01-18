@@ -1,3 +1,5 @@
+*.json
+*.tsv
 *.pyc
 *.h5
 *.tif
@@ -9,3 +11,5 @@
 *_usage
 *.ipynb
 logs/*
+*.sh
+*.png
